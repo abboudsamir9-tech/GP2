@@ -1,0 +1,8 @@
+front_camera_id: 0
+side_camera_id: 1
+target_fps: 30
+buffer_size: 1
+sync_tolerance_ms: 40
+watchdog_window_frames: 150
+drop_rate_threshold: 0.05
+

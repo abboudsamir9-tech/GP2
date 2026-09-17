@@ -1,0 +1,6 @@
+device: auto
+latency_target_ms_p95: 500
+privacy:
+  persist_live_frames: false
+  transmit_live_frames: false
+

@@ -1,0 +1,7 @@
+max_interpolation_gap: 4
+savgol_window_length: 7
+savgol_polyorder: 2
+normalization_epsilon: 1.0e-6
+window_size: 45
+stride: 8
+

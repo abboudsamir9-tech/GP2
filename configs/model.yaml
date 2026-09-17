@@ -1,0 +1,8 @@
+input_features: 138
+projection_features: 128
+hidden_size: 256
+num_lstm_layers: 2
+bidirectional: true
+confidence_threshold: 0.65
+margin_threshold: 0.15
+
