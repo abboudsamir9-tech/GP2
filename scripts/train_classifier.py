@@ -214,7 +214,9 @@ def train_classifier(
     print("+-------+------------+-----------+------------+-----------+")
     best_accuracy = -1.0
     best_loss = float("inf")
-    output = Path(output_weights)
+    # Keep the CLI argument as a string or Path until the checkpoint writer
+    # sanitizes and resolves it; its return value is the canonical path.
+    output = output_weights
     for epoch in range(1, epochs + 1):
         train_loss, train_accuracy = run_epoch(
             model, train_loader, criterion, optimizer
@@ -233,7 +235,7 @@ def train_classifier(
         if improved:
             best_accuracy = validation_accuracy
             best_loss = validation_loss
-            save_training_checkpoint(
+            output = save_training_checkpoint(
                 model,
                 output,
                 num_classes=len(class_map),

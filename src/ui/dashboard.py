@@ -7,6 +7,7 @@ import threading
 import time
 from collections.abc import Callable, MutableMapping
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -30,22 +31,31 @@ from PyQt5.QtWidgets import (
 )
 
 from asl_stereo.capture import CameraWorker, DropReason, Synchronizer, SyncWatchdog
+from asl_stereo.contracts import TimestampedFrame
 from asl_stereo.landmarks import HolisticExtractor, draw_asl_overlay
-from asl_stereo.models import InferenceEngine
+from asl_stereo.models import InferenceEngine, SignSequenceClassifier
+from asl_stereo.models.checkpoint import load_class_map
 from asl_stereo.preprocessing import PreprocessingPipeline, SlidingWindowBuffer
 from asl_stereo.stereo import JointStatus, StereoCalibration, StereoMatcher
+from asl_stereo.translation.confidence_filter import ConfidenceFilter
 
 from .qt_messages import map_telemetry, prediction_text
 from .text_ticker import TranslationTicker
 
 LOGGER = logging.getLogger(__name__)
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+CAMERA_INDICES = (0, 1, 2)
+CAMERA_RESOLUTION = (1280, 720)
+CAMERA_FPS = 60.0
+CAMERA_TIMEOUT_S = 5.0
+GUI_MIN_CONFIDENCE = 0.35
 
 
 @dataclass(slots=True)
 class RuntimeSettings:
-    front_camera_index: int = 0
-    side_camera_index: int = 1
-    confidence_threshold: float = 0.65
+    front_camera_index: int = 1
+    side_camera_index: int = 0
+    confidence_threshold: float = 0.40
 
 
 class PipelineWorker(QThread):
@@ -77,9 +87,9 @@ class PipelineWorker(QThread):
         self._front_camera: CameraWorker | None = None
         self._side_camera: CameraWorker | None = None
         self._threshold_lock = threading.Lock()
-        self._confidence_threshold = max(
-            settings.confidence_threshold, InferenceEngine.MIN_CONFIDENCE
-        )
+        self._confidence_threshold = max(settings.confidence_threshold, GUI_MIN_CONFIDENCE)
+        self._buffer_full_logged = False
+        self._invalid_window_count = 0
         self._frame_mailbox_lock = threading.Lock()
         self._latest_frames: tuple[np.ndarray, np.ndarray] | None = None
         self._frame_signal_pending = False
@@ -88,7 +98,7 @@ class PipelineWorker(QThread):
         if not 0.0 <= value <= 1.0:
             raise ValueError("confidence threshold must be in [0, 1]")
         with self._threshold_lock:
-            self._confidence_threshold = max(value, InferenceEngine.MIN_CONFIDENCE)
+            self._confidence_threshold = max(value, GUI_MIN_CONFIDENCE)
 
     def consume_latest_frames(self) -> tuple[np.ndarray, np.ndarray] | None:
         """Consume the coalesced newest UI frame pair and acknowledge delivery."""
@@ -120,52 +130,134 @@ class PipelineWorker(QThread):
             if camera is not None:
                 camera.request_stop()
 
+    def _open_camera(
+        self, index: int, camera_id: str
+    ) -> tuple[CameraWorker, TimestampedFrame]:
+        camera = self._camera_factory(
+            index,
+            camera_id=camera_id,
+            resolution=CAMERA_RESOLUTION,
+            target_fps=CAMERA_FPS,
+        )
+        try:
+            camera.start(timeout=CAMERA_TIMEOUT_S)
+            first_frame = camera.get_frame(timeout=1.5)
+            if (
+                first_frame is None
+                or first_frame.frame_buffer.size == 0
+                or first_frame.frame_buffer.ndim != 3
+                or first_frame.frame_buffer.shape[2] != 3
+            ):
+                raise RuntimeError("no non-empty BGR frame after warmup")
+            if not camera.is_running:
+                raise RuntimeError(f"capture stopped: {camera.last_error!r}")
+            achieved_fps = camera.actual_fps
+            height, width = first_frame.frame_buffer.shape[:2]
+            print(
+                f"[GUI INFO] Opened {camera_id} camera at index {index} "
+                f"({width}x{height}, reported {achieved_fps or 0.0:.1f} FPS)",
+                flush=True,
+            )
+            return camera, first_frame
+        except Exception:
+            try:
+                camera.stop()
+            except Exception:
+                LOGGER.debug("Camera cleanup failed", exc_info=True)
+            raise
+
+    def _load_default_engine(self) -> None:
+        if self.inference_engine is not None:
+            return
+        class_map = load_class_map(PROJECT_ROOT / "configs" / "class_map.json")
+        failures: list[str] = []
+        for artifact in (
+            PROJECT_ROOT / "weights" / "optimized_model.pt",
+            PROJECT_ROOT / "weights" / "best_model.pth",
+        ):
+            if not artifact.is_file():
+                failures.append(f"{artifact}: missing")
+                continue
+            try:
+                self.inference_engine = InferenceEngine(
+                    SignSequenceClassifier(num_classes=len(class_map)),
+                    class_map,
+                    checkpoint_path=artifact,
+                )
+            except (OSError, RuntimeError, ValueError, KeyError) as error:
+                failures.append(f"{artifact}: {error}")
+                LOGGER.warning("Model artifact unavailable: %s (%s)", artifact, error)
+                continue
+            print(f"[GUI INFO] Loaded model: {artifact}", flush=True)
+            return
+        raise RuntimeError("No usable model artifact. " + "; ".join(failures))
+
     def run(self) -> None:
         front_camera: CameraWorker | None = None
         side_camera: CameraWorker | None = None
         front_extractor: HolisticExtractor | None = None
         side_extractor: HolisticExtractor | None = None
         try:
+            self._load_default_engine()
             synchronizer = Synchronizer(front_camera_id="front", side_camera_id="side")
             watchdog = SyncWatchdog(purge_callback=synchronizer.purge)
             matcher = StereoMatcher(self.calibration, fallback_scope="frame")
             preprocessor = PreprocessingPipeline()
             window_buffer = SlidingWindowBuffer()
 
-            front_camera = self._camera_factory(
-                self.settings.front_camera_index, camera_id="front"
-            )
+            candidates = list(dict.fromkeys((self.settings.front_camera_index, *CAMERA_INDICES)))
+            camera_failures: list[str] = []
+            first_front = None
+            selected_front = None
+            for index in candidates:
+                if self._stop_event.is_set():
+                    return
+                try:
+                    front_camera, first_front = self._open_camera(index, "front")
+                except Exception as error:
+                    reason = error.__cause__ or error
+                    camera_failures.append(f"index {index}: {reason}")
+                    print(f"[GUI WARNING] Front camera index {index}: {reason}", flush=True)
+                    continue
+                selected_front = index
+                break
+            if front_camera is None:
+                raise RuntimeError("No working front camera. " + "; ".join(camera_failures))
             with self._resource_lock:
                 self._front_camera = front_camera
             front_extractor = self._extractor_factory()
-            front_camera.start()
 
-            try:
-                side_camera = self._camera_factory(
-                    self.settings.side_camera_index, camera_id="side"
-                )
-                with self._resource_lock:
-                    self._side_camera = side_camera
-                side_camera.start()
-                side_extractor = self._extractor_factory()
-            except Exception as error:
-                LOGGER.warning(
-                    "Side camera unavailable; entering single-camera fallback: %s",
-                    error,
-                )
-                if side_camera is not None:
-                    try:
-                        side_camera.stop()
-                    except Exception:
-                        LOGGER.debug("Side-camera cleanup failed", exc_info=True)
-                side_camera = None
+            first_side = None
+            if self.settings.side_camera_index != selected_front:
+                try:
+                    side_camera, first_side = self._open_camera(
+                        self.settings.side_camera_index, "side"
+                    )
+                    with self._resource_lock:
+                        self._side_camera = side_camera
+                    side_extractor = self._extractor_factory()
+                except Exception as error:
+                    LOGGER.warning("Side camera unavailable: %s", error)
+                    print(f"[GUI WARNING] Side camera unavailable: {error}", flush=True)
+                    if side_camera is not None:
+                        try:
+                            side_camera.stop()
+                        except Exception:
+                            LOGGER.debug("Side-camera cleanup failed", exc_info=True)
+                        side_camera = None
+            if side_camera is None:
+                print("[GUI INFO] [SINGLE-CAMERA FALLBACK]", flush=True)
                 with self._resource_lock:
                     self._side_camera = None
 
             frame_count = 0
             fps_started = time.perf_counter()
+            last_front_time = time.monotonic()
+            last_pair_time = last_front_time
             previous_sync_rejects = 0
             while not self._stop_event.is_set() and not self.isInterruptionRequested():
+                if not front_camera.is_running:
+                    raise RuntimeError(f"front camera stopped: {front_camera.last_error!r}")
                 if side_camera is not None and not side_camera.is_running:
                     LOGGER.warning(
                         "Side camera stopped; entering single-camera fallback"
@@ -180,14 +272,20 @@ class PipelineWorker(QThread):
                         side_extractor = None
                     synchronizer.purge()
                     window_buffer.reset()
+                    self._buffer_full_logged = False
+                    self._invalid_window_count = 0
                     with self._resource_lock:
                         self._side_camera = None
 
                 if side_camera is None:
-                    front_frame = front_camera.get_frame()
+                    front_frame = first_front or front_camera.get_frame()
+                    first_front = None
                     if front_frame is None:
+                        if time.monotonic() - last_front_time > CAMERA_TIMEOUT_S:
+                            raise RuntimeError("front camera stopped delivering frames")
                         self.msleep(1)
                         continue
+                    last_front_time = time.monotonic()
                     self._process_single_frame(
                         front_frame,
                         front_extractor,
@@ -200,12 +298,15 @@ class PipelineWorker(QThread):
                     continue
 
                 pairs = []
-                front_frame = front_camera.get_frame()
+                front_frame = first_front or front_camera.get_frame()
+                first_front = None
                 if front_frame is not None:
+                    last_front_time = time.monotonic()
                     pair = synchronizer.add_front(front_frame)
                     if pair is not None:
                         pairs.append(pair)
-                side_frame = side_camera.get_frame()
+                side_frame = first_side or side_camera.get_frame()
+                first_side = None
                 if side_frame is not None:
                     pair = synchronizer.add_side(side_frame)
                     if pair is not None:
@@ -217,6 +318,7 @@ class PipelineWorker(QThread):
                 previous_sync_rejects = synchronizer.sync_rejects
 
                 for pair in pairs:
+                    last_pair_time = time.monotonic()
                     watchdog.record_frame()
                     watchdog.next_pair_index()
                     self._process_pair(
@@ -235,11 +337,38 @@ class PipelineWorker(QThread):
                 if watchdog.should_purge():
                     watchdog.purge()
                     window_buffer.reset()
+                    self._buffer_full_logged = False
+                    self._invalid_window_count = 0
                     previous_sync_rejects = synchronizer.sync_rejects
                 if not pairs:
+                    if time.monotonic() - last_front_time > CAMERA_TIMEOUT_S:
+                        raise RuntimeError("front camera stopped delivering frames")
+                    if time.monotonic() - last_pair_time > 3.0:
+                        print(
+                            "[GUI WARNING] No synchronized pairs; entering "
+                            "[SINGLE-CAMERA FALLBACK]",
+                            flush=True,
+                        )
+                        try:
+                            side_camera.stop()
+                        except Exception:
+                            LOGGER.debug("Side-camera cleanup failed", exc_info=True)
+                        side_camera = None
+                        if side_extractor is not None:
+                            side_extractor.close()
+                            side_extractor = None
+                        synchronizer.purge()
+                        window_buffer.reset()
+                        self._buffer_full_logged = False
+                        self._invalid_window_count = 0
+                        with self._resource_lock:
+                            self._side_camera = None
+                        continue
                     self.msleep(1)
         except Exception as error:
             if not self._stop_event.is_set():
+                LOGGER.exception("GUI pipeline failed")
+                print(f"[GUI ERROR] {type(error).__name__}: {error}", flush=True)
                 self.error_occurred.emit(f"{type(error).__name__}: {error}")
         finally:
             for extractor in (front_extractor, side_extractor):
@@ -372,20 +501,57 @@ class PipelineWorker(QThread):
     def _run_inference(
         self, tensor, window_buffer: SlidingWindowBuffer
     ) -> float:
-        if tensor is None or self.inference_engine is None:
+        if (
+            window_buffer.raw_frame_count == window_buffer.window_size
+            and not self._buffer_full_logged
+        ):
+            print(
+                f"[GUI DEBUG] Temporal buffer reached "
+                f"{window_buffer.window_size} frames",
+                flush=True,
+            )
+            self._buffer_full_logged = True
+        if tensor is None:
+            if window_buffer.raw_frame_count == window_buffer.window_size:
+                self._invalid_window_count += 1
+                if self._invalid_window_count == 1 or self._invalid_window_count % 30 == 0:
+                    print(
+                        "[GUI DEBUG] Full window is not yet finite; waiting for "
+                        "visible shoulders, elbows, and an active hand",
+                        flush=True,
+                    )
             return 0.0
+        if self.inference_engine is None:
+            raise RuntimeError("Inference engine is not initialized")
+        self._invalid_window_count = 0
         result = self.inference_engine.predict(tensor)
         with self._threshold_lock:
-            threshold = max(
-                self._confidence_threshold, InferenceEngine.MIN_CONFIDENCE
-            )
-        decision = self.inference_engine.gate_prediction(
-            result,
+            threshold = self._confidence_threshold
+        labels = tuple(
+            self.inference_engine.class_map[index]
+            for index in range(len(self.inference_engine.class_map))
+        )
+        decision = ConfidenceFilter(
             confidence_threshold=threshold,
             margin_threshold=InferenceEngine.MIN_MARGIN,
+        ).apply(
+            result.probabilities,
+            labels,
+            inference_duration_ms=result.latency_ms,
             window_end_timestamp_ns=window_buffer.last_window_end_timestamp_ns or 0,
         )
+        print(
+            f"[GUI DEBUG] Inference: {result.predicted_gloss} "
+            f"conf={result.confidence_score:.2f} margin={decision.margin:.2f} "
+            f"latency={result.latency_ms:.1f}ms "
+            f"status={'ACCEPTED' if decision.accepted else decision.rejection_reason}",
+            flush=True,
+        )
         if decision.accepted:
+            print(
+                f"[GUI DEBUG] Emitting gloss signal: '{result.predicted_gloss}'",
+                flush=True,
+            )
             self.prediction_ready.emit(
                 result.predicted_gloss, result.confidence_score, result.latency_ms
             )
@@ -416,7 +582,7 @@ class SettingsDialog(QDialog):
         self.side_camera_spin.setRange(0, 32)
         self.side_camera_spin.setValue(int(_config_get(configuration, "side_camera_index")))
         self.confidence_slider = QSlider(Qt.Horizontal, self)
-        self.confidence_slider.setRange(65, 100)
+        self.confidence_slider.setRange(35, 100)
         self.confidence_slider.setValue(
             round(float(_config_get(configuration, "confidence_threshold")) * 100)
         )
@@ -619,10 +785,22 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot(str, float, float)
     def _handle_prediction(self, gloss: str, confidence: float, latency_ms: float) -> None:
+        print(
+            f"[GUI DEBUG] Received gloss signal: '{gloss}' "
+            f"(conf: {confidence:.2f})",
+            flush=True,
+        )
         self._last_confidence = confidence
         self.confidence_bar.setValue(round(confidence * 100))
-        self.prediction_detail.setText(prediction_text(gloss, confidence, latency_ms))
-        self.ticker.add_gloss(gloss)
+        self.prediction_detail.setText(
+            "Last detected: " + prediction_text(gloss, confidence, latency_ms)
+        )
+        appended = self.ticker.add_gloss(gloss)
+        print(
+            f"[GUI DEBUG] Translation ticker "
+            f"{'updated' if appended else 'debounced'}: {self.ticker.text!r}",
+            flush=True,
+        )
 
     @pyqtSlot(dict)
     def _update_telemetry(self, telemetry: dict[str, Any]) -> None:

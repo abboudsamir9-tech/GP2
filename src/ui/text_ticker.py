@@ -35,6 +35,10 @@ class TranslationTicker(QWidget):
         self.text_display.setAcceptRichText(False)
         self.text_display.setFont(QFont("Segoe UI", 26, QFont.DemiBold))
         self.text_display.setPlaceholderText("Recognized signs will appear here…")
+        self.text_display.setStyleSheet(
+            "QTextEdit { background: #0E1726; color: #FFFFFF; "
+            "border: 2px solid #FFC107; border-radius: 6px; padding: 12px; }"
+        )
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -72,6 +76,7 @@ class TranslationTicker(QWidget):
         cursor.movePosition(QTextCursor.End)
         self.text_display.setTextCursor(cursor)
         self.text_display.ensureCursorVisible()
+        self.text_display.update()
         return True
 
     @pyqtSlot()

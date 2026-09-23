@@ -194,5 +194,10 @@ class SlidingWindowBuffer(TemporalBuffer):
         self.last_window_start_timestamp_ns = None
         self.last_window_end_timestamp_ns = None
 
+    @property
+    def raw_frame_count(self) -> int:
+        """Number of raw landmark frames currently available for cleaning."""
+        return len(self._raw_landmarks)
+
 
 __all__ = ["SlidingWindowBuffer", "TemporalBuffer"]

@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import json
+import logging
+import os
+import tempfile
+import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -20,6 +24,40 @@ CHECKPOINT_KEYS = {
     "epoch",
     "best_val_acc",
 }
+LOGGER = logging.getLogger(__name__)
+_REPLACE_ATTEMPTS = 5
+_REPLACE_RETRY_SECONDS = 0.1
+
+
+def _resolve_checkpoint_output_path(output_path: str | Path) -> tuple[Path, str]:
+    """Remove CLI quoting and control characters without changing path spaces."""
+    if not isinstance(output_path, (str, Path)):
+        raise TypeError("output_path must be a string or Path")
+    clean_path = str(output_path).strip()
+    clean_path = clean_path.translate({ord(char): None for char in "\x00\r\n\t"})
+    clean_path = clean_path.strip().strip("'\"“”‘’").strip()
+    if not clean_path:
+        raise ValueError("checkpoint output path is empty after sanitization")
+    try:
+        return Path(clean_path).expanduser().resolve(), clean_path
+    except OSError as error:
+        if error.errno == 22:
+            LOGGER.error("Invalid checkpoint output path: %r", clean_path)
+        raise
+
+
+def _replace_checkpoint_with_retry(temporary_path: Path, output_path: Path) -> None:
+    """Wait briefly for transient Windows sharing locks on the target."""
+    for attempt in range(_REPLACE_ATTEMPTS):
+        try:
+            os.replace(temporary_path, output_path)
+            return
+        except PermissionError as error:
+            if os.name != "nt" or getattr(error, "winerror", None) not in {5, 32, 33}:
+                raise
+            if attempt == _REPLACE_ATTEMPTS - 1:
+                raise
+            time.sleep(_REPLACE_RETRY_SECONDS * (attempt + 1))
 
 
 def load_checkpoint(checkpoint_path: str | Path) -> Mapping[str, Any]:
@@ -66,8 +104,10 @@ def save_training_checkpoint(
         raise ValueError("checkpoint dimensions and epoch are invalid")
     if not 0.0 <= best_val_acc <= 1.0:
         raise ValueError("best_val_acc must be in [0, 1]")
-    output = Path(output_path)
+
+    output, clean_path = _resolve_checkpoint_output_path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
+
     payload = {
         "model_state_dict": model.state_dict(),
         "num_classes": num_classes,
@@ -75,9 +115,38 @@ def save_training_checkpoint(
         "feature_dim": feature_dim,
         "model_type": model_type,
         "epoch": epoch,
-        "best_val_acc": best_val_acc,
+        "best_val_acc": float(best_val_acc),
     }
-    torch.save(payload, output)
+
+    temporary_path: Path | None = None
+    try:
+        # The handle must be closed before os.replace on Windows.  Keeping the
+        # temporary file beside the target also permits an atomic replacement.
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=output.parent,
+            prefix=f".{output.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary_file:
+            temporary_path = Path(temporary_file.name)
+            torch.save(payload, temporary_file)
+            temporary_file.flush()
+            os.fsync(temporary_file.fileno())
+        _replace_checkpoint_with_retry(temporary_path, output)
+    except OSError as error:
+        if error.errno == 22:
+            LOGGER.error("Invalid checkpoint output path: %r", clean_path)
+        raise
+    finally:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError:
+                LOGGER.warning(
+                    "Could not remove temporary checkpoint: %r", str(temporary_path)
+                )
+
     return output
 
 

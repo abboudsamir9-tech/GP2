@@ -26,10 +26,10 @@ class PreprocessingConfig:
 class PreprocessingPipeline:
     """Apply the shared live/offline preprocessing contract.
 
-    Live frames use :meth:`process_frame`, because interpolation and symmetric
-    Savitzky-Golay smoothing require temporal context and future observations.
-    Dataset preparation uses :meth:`process_sequence` for the complete cleaning
-    chain. Both paths share normalization and feature encoding.
+    Single frames use :meth:`process_frame` for validity checks. Inference uses
+    :meth:`process_live_window` so interpolation and smoothing see the same
+    temporal context as dataset preparation. Both paths share normalization
+    and feature encoding.
     """
 
     def __init__(self, config: PreprocessingConfig | None = None) -> None:
@@ -74,8 +74,16 @@ class PreprocessingPipeline:
     def process_live_window(
         self, sequence: npt.ArrayLike
     ) -> npt.NDArray[np.float32]:
-        """Clean one complete live window exactly like an offline sequence."""
-        return self.process_sequence(sequence)
+        """Clean a live window, including the offline neutral-hand convention."""
+        raw = np.asarray(sequence)
+        cleaned = self.process_sequence(raw)
+        for joints, features in (
+            (slice(0, 21), slice(0, 63)),
+            (slice(21, 42), slice(63, 126)),
+        ):
+            if np.isnan(raw[:, joints, :]).all():
+                cleaned[:, features] = np.float32(0.0)
+        return cleaned
 
 
 __all__ = ["PreprocessingConfig", "PreprocessingPipeline"]

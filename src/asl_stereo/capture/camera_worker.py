@@ -53,6 +53,12 @@ def _resolution_properties() -> tuple[int, int]:
     return int(cv2.CAP_PROP_FRAME_WIDTH), int(cv2.CAP_PROP_FRAME_HEIGHT)
 
 
+def _fps_property() -> int:
+    import cv2
+
+    return int(cv2.CAP_PROP_FPS)
+
+
 class CameraWorker:
     """Capture frames on a daemon thread and expose only the newest frame.
 
@@ -68,6 +74,7 @@ class CameraWorker:
         camera_id: str,
         warmup_frames: int = 10,
         resolution: tuple[int, int] | None = None,
+        target_fps: float | None = None,
         capture_factory: CaptureFactory | None = None,
         monotonic_ns: Callable[[], int] = time.monotonic_ns,
         failure_backoff_s: float = 0.005,
@@ -80,6 +87,13 @@ class CameraWorker:
             raise ValueError("warmup_frames must be non-negative")
         if failure_backoff_s < 0:
             raise ValueError("failure_backoff_s must be non-negative")
+        if target_fps is not None and (
+            isinstance(target_fps, bool)
+            or not isinstance(target_fps, (int, float))
+            or not np.isfinite(target_fps)
+            or target_fps <= 0
+        ):
+            raise ValueError("target_fps must be a positive finite number")
         if resolution is not None:
             if (
                 len(resolution) != 2
@@ -92,6 +106,7 @@ class CameraWorker:
         self.camera_id = camera_id
         self.warmup_frames = warmup_frames
         self.resolution = resolution
+        self.target_fps = None if target_fps is None else float(target_fps)
         self._capture_factory = capture_factory or _open_cv_capture
         self._monotonic_ns = monotonic_ns
         self._failure_backoff_s = failure_backoff_s
@@ -107,6 +122,7 @@ class CameraWorker:
         self._frame_index = 0
         self._capture_failures = 0
         self._backpressure_drops = 0
+        self._actual_fps: float | None = None
 
     def start(self, *, timeout: float = 5.0) -> None:
         """Start ingestion and wait until camera setup/warmup completes."""
@@ -151,13 +167,34 @@ class CameraWorker:
                 width, height = self.resolution
                 capture.set(width_property, float(width))
                 capture.set(height_property, float(height))
+            if self.target_fps is not None:
+                try:
+                    capture.set(_fps_property(), self.target_fps)
+                except Exception:
+                    # Some backends reject FPS negotiation despite opening the
+                    # device; software capture can continue at the native rate.
+                    pass
+            get_property = getattr(capture, "get", None)
+            if callable(get_property):
+                try:
+                    reported_fps = float(get_property(_fps_property()))
+                except Exception:
+                    reported_fps = 0.0
+                if np.isfinite(reported_fps) and reported_fps > 0:
+                    self._actual_fps = reported_fps
 
             warmed_frames = 0
             while warmed_frames < self.warmup_frames:
                 if self._stop_event.is_set():
                     return
-                ok, _ = capture.read()
-                if ok:
+                ok, warmup_frame = capture.read()
+                if (
+                    ok
+                    and isinstance(warmup_frame, np.ndarray)
+                    and warmup_frame.size > 0
+                    and warmup_frame.dtype == np.uint8
+                    and warmup_frame.ndim in (2, 3)
+                ):
                     warmed_frames += 1
                     continue
 
@@ -174,7 +211,7 @@ class CameraWorker:
             while not self._stop_event.is_set():
                 ok, raw_frame = capture.read()
                 timestamp_ns = self._monotonic_ns()
-                if not ok or not isinstance(raw_frame, np.ndarray):
+                if not ok or not isinstance(raw_frame, np.ndarray) or raw_frame.size == 0:
                     self._capture_failures += 1
                     if self._failure_backoff_s:
                         self._stop_event.wait(self._failure_backoff_s)
@@ -271,6 +308,16 @@ class CameraWorker:
     @property
     def backpressure_drops(self) -> int:
         return self._backpressure_drops
+
+    @property
+    def actual_fps(self) -> float | None:
+        """Backend-reported FPS, or None when the driver does not report it."""
+        return self._actual_fps
+
+    @property
+    def last_error(self) -> BaseException | None:
+        """Expose a background capture failure to the consumer loop."""
+        return self._startup_error
 
     def __enter__(self: _CameraWorkerT) -> _CameraWorkerT:
         self.start()
