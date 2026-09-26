@@ -1,9 +1,16 @@
-"""CPU-conscious MediaPipe Holistic extraction into the 46-joint contract."""
+"""Pose Lite + Hands Lite extraction into the strict 46-joint contract.
+
+The historical module and class name remain as compatibility aliases; this
+module never instantiates a Holistic, face, or segmentation graph.
+"""
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from pathlib import Path
 from types import TracebackType
 from typing import Any, TypeVar
 
@@ -11,13 +18,9 @@ import numpy as np
 import numpy.typing as npt
 
 from asl_stereo.contracts import JOINT_COUNT, LandmarkFrame
+from .landmark_mapping import HAND_LANDMARK_COUNT, LEFT_HAND_OFFSET, POSE_SOURCE_TO_OUTPUT, RIGHT_HAND_OFFSET
 
-from .landmark_mapping import (
-    HAND_LANDMARK_COUNT,
-    LEFT_HAND_OFFSET,
-    POSE_SOURCE_TO_OUTPUT,
-    RIGHT_HAND_OFFSET,
-)
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,46 +31,76 @@ class OverlayPoint:
 
 
 @dataclass(frozen=True, slots=True)
-class RestrictedHolisticResults:
-    """Only data permitted to survive a Holistic inference call."""
+class RestrictedPoseHandsResults:
+    """Only the 46 permitted landmarks retained for overlay rendering."""
 
     left_hand_landmarks: tuple[OverlayPoint, ...] | None
     right_hand_landmarks: tuple[OverlayPoint, ...] | None
     upper_body_landmarks: tuple[tuple[int, OverlayPoint], ...]
 
 
-_ExtractorT = TypeVar("_ExtractorT", bound="HolisticExtractor")
+RestrictedHolisticResults = RestrictedPoseHandsResults
+_ExtractorT = TypeVar("_ExtractorT", bound="PoseHandsExtractor")
 
 
-class HolisticExtractor:
-    """Run one Holistic pass and retain only contract-approved landmarks."""
+class PoseHandsExtractor:
+    """Process one downscaled RGB image with independent pose and hands graphs."""
 
     def __init__(
         self,
         *,
-        holistic_factory: Callable[..., Any] | None = None,
-        model_complexity: int = 1,
+        pose_factory: Callable[..., Any] | None = None,
+        hands_factory: Callable[..., Any] | None = None,
+        model_complexity: int = 0,
+        processing_resolution: tuple[int, int] = (640, 360),
         min_detection_confidence: float = 0.5,
         min_tracking_confidence: float = 0.5,
+        input_is_mirrored: bool = False,
     ) -> None:
-        if holistic_factory is None:
+        if len(processing_resolution) != 2 or any(value <= 0 for value in processing_resolution):
+            raise ValueError("processing_resolution must contain positive width and height")
+        if model_complexity not in (0, 1):
+            raise ValueError("model_complexity must be 0 or 1")
+        self.processing_resolution = processing_resolution
+        self.input_is_mirrored = bool(input_is_mirrored)
+        if pose_factory is None or hands_factory is None:
             import mediapipe as mp
-
-            holistic_factory = mp.solutions.holistic.Holistic
-        self._model = holistic_factory(
+            if pose_factory is None:
+                lite_model = Path(mp.__file__).resolve().parent / "modules" / "pose_landmark" / "pose_landmark_lite.tflite"
+                if model_complexity == 0 and not lite_model.is_file():
+                    LOGGER.warning("MediaPipe Lite pose model missing at %s; using bundled full pose model", lite_model)
+                    model_complexity = 1
+                pose_factory = mp.solutions.pose.Pose
+            if hands_factory is None:
+                hands_factory = mp.solutions.hands.Hands
+        self.model_complexity = model_complexity
+        self.pose_tracker = pose_factory(
             static_image_mode=False,
             model_complexity=model_complexity,
-            smooth_landmarks=True,
             enable_segmentation=False,
-            refine_face_landmarks=False,
             min_detection_confidence=min_detection_confidence,
             min_tracking_confidence=min_tracking_confidence,
         )
-        self._last_results: RestrictedHolisticResults | None = None
+        try:
+            self.hand_tracker = hands_factory(
+                static_image_mode=False,
+                max_num_hands=2,
+                model_complexity=0,
+                min_detection_confidence=min_detection_confidence,
+                min_tracking_confidence=min_tracking_confidence,
+            )
+        except BaseException:
+            self.pose_tracker.close()
+            raise
+        # The independent MediaPipe graphs release the GIL while running.
+        # Parallel calls reduce per-frame latency from the sum to roughly the
+        # slower tracker, without sharing tracker state across camera views.
+        self._tracker_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="asl-track")
+        self._last_results: RestrictedPoseHandsResults | None = None
         self._closed = False
 
     @property
-    def last_results(self) -> RestrictedHolisticResults | None:
+    def last_results(self) -> RestrictedPoseHandsResults | None:
         return self._last_results
 
     def process(
@@ -81,38 +114,41 @@ class HolisticExtractor:
             raise RuntimeError("extractor is closed")
         if not isinstance(frame, np.ndarray) or frame.dtype != np.uint8:
             raise TypeError("frame must be a uint8 numpy array")
-        if frame.ndim == 2:
-            rgb = np.repeat(frame[:, :, None], 3, axis=2)
-        elif frame.ndim == 3 and frame.shape[2] == 3:
-            rgb = np.ascontiguousarray(frame[:, :, ::-1])
-        else:
-            raise ValueError("frame must have shape (height, width) or (height, width, 3)")
+        if frame.ndim not in (2, 3) or 0 in frame.shape[:2]:
+            raise ValueError("frame must be a non-empty image")
+        import cv2
 
-        raw_results = self._model.process(rgb)
+        height, width = frame.shape[:2]
+        max_width, max_height = self.processing_resolution
+        scale = min(1.0, max_width / width, max_height / height)
+        if scale < 1.0:
+            frame = cv2.resize(
+                frame,
+                (max(1, round(width * scale)), max(1, round(height * scale))),
+                interpolation=cv2.INTER_AREA,
+            )
+        if frame.ndim == 2:
+            rgb = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
+        elif frame.ndim == 3 and frame.shape[2] == 3:
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        else:
+            raise ValueError("frame must be grayscale or BGR with three channels")
+        rgb.flags.writeable = False
+
+        pose_future = self._tracker_pool.submit(self.pose_tracker.process, rgb)
+        hands_future = self._tracker_pool.submit(self.hand_tracker.process, rgb)
+        pose_results = pose_future.result()
+        hands_results = hands_future.result()
         coordinates = np.full((JOINT_COUNT, 3), np.nan, dtype=np.float32)
         hand_present = np.zeros(2, dtype=np.float32)
-
-        left = self._extract_hand(
-            getattr(raw_results, "left_hand_landmarks", None),
-            coordinates,
-            LEFT_HAND_OFFSET,
-        )
+        upper_body = self._extract_upper_body(getattr(pose_results, "pose_landmarks", None), coordinates)
+        assigned = self._assign_hands(hands_results, coordinates)
+        left, right = assigned.get("Left"), assigned.get("Right")
         if left is not None:
             hand_present[0] = 1.0
-
-        right = self._extract_hand(
-            getattr(raw_results, "right_hand_landmarks", None),
-            coordinates,
-            RIGHT_HAND_OFFSET,
-        )
         if right is not None:
             hand_present[1] = 1.0
-
-        upper_body = self._extract_upper_body(
-            getattr(raw_results, "pose_landmarks", None), coordinates
-        )
-        self._last_results = RestrictedHolisticResults(left, right, upper_body)
-
+        self._last_results = RestrictedPoseHandsResults(left, right, upper_body)
         assert coordinates.shape == (JOINT_COUNT, 3)
         joint_mask = np.isfinite(coordinates).all(axis=1).astype(np.float32)
         return LandmarkFrame(
@@ -123,36 +159,70 @@ class HolisticExtractor:
             frame_index=frame_index,
         )
 
-    @staticmethod
-    def _extract_hand(
-        container: Any,
-        output: npt.NDArray[np.float32],
-        offset: int,
-    ) -> tuple[OverlayPoint, ...] | None:
-        if container is None:
-            return None
-        source = getattr(container, "landmark", None)
-        if source is None or len(source) != HAND_LANDMARK_COUNT:
-            return None
+    def _assign_hands(
+        self, results: Any, output: npt.NDArray[np.float32]
+    ) -> dict[str, tuple[OverlayPoint, ...]]:
+        containers = getattr(results, "multi_hand_landmarks", None) or ()
+        handedness = getattr(results, "multi_handedness", None) or ()
+        candidates: list[tuple[tuple[OverlayPoint, ...], str | None]] = []
+        for index, container in enumerate(containers[:2]):
+            source = getattr(container, "landmark", None)
+            if source is None or len(source) != HAND_LANDMARK_COUNT:
+                continue
+            points = tuple(_finite_point_or_nan(point) for point in source)
+            classifications = getattr(handedness[index], "classification", ()) if index < len(handedness) else ()
+            top = classifications[0] if classifications else None
+            label = getattr(top, "label", None)
+            score = float(getattr(top, "score", 0.0)) if top is not None else 0.0
+            # MediaPipe Hands labels assume a selfie-mirrored image. OpenCV feeds
+            # here are unmirrored unless input_is_mirrored is explicitly set.
+            if label in ("Left", "Right") and not self.input_is_mirrored:
+                label = "Right" if label == "Left" else "Left"
+            if label not in ("Left", "Right") or not np.isfinite(score) or score < 0.5:
+                label = None
+            candidates.append((points, label))
 
-        retained: list[OverlayPoint] = []
-        for local_index, landmark in enumerate(source):
-            point = _finite_point_or_nan(landmark)
-            retained.append(point)
-            if np.isfinite((point.x, point.y, point.z)).all():
-                output[offset + local_index] = (point.x, point.y, point.z)
-        return tuple(retained)
+        assigned: dict[str, tuple[OverlayPoint, ...]] = {}
+        # Trusted handedness wins when the arms cross; pose is the fallback.
+        for points, label in candidates:
+            if label is not None and label not in assigned:
+                assigned[label] = points
+        for points, _ in candidates:
+            if any(points is selected for selected in assigned.values()):
+                continue
+            available = [side for side in ("Left", "Right") if side not in assigned]
+            if not available:
+                break
+            side = min(available, key=lambda name: self._hand_distance(points[0], name, output))
+            assigned[side] = points
+        for side, points in assigned.items():
+            offset = LEFT_HAND_OFFSET if side == "Left" else RIGHT_HAND_OFFSET
+            for local_index, point in enumerate(points):
+                if np.isfinite((point.x, point.y, point.z)).all():
+                    output[offset + local_index] = (point.x, point.y, point.z)
+        return assigned
+
+    def _hand_distance(
+        self, wrist: OverlayPoint, side: str, output: npt.NDArray[np.float32]
+    ) -> float:
+        shoulder_index, elbow_index = (42, 44) if side == "Left" else (43, 45)
+        for index in (elbow_index, shoulder_index):
+            reference = output[index, :2]
+            if np.isfinite(reference).all() and np.isfinite((wrist.x, wrist.y)).all():
+                return float(np.hypot(wrist.x - reference[0], wrist.y - reference[1]))
+        if not np.isfinite(wrist.x):
+            return float("inf")
+        # Anatomical left appears on image right in an unmirrored frame.
+        left_x = wrist.x if self.input_is_mirrored else 1.0 - wrist.x
+        return left_x if side == "Left" else 1.0 - left_x
 
     @staticmethod
     def _extract_upper_body(
         container: Any, output: npt.NDArray[np.float32]
     ) -> tuple[tuple[int, OverlayPoint], ...]:
-        if container is None:
-            return ()
         source = getattr(container, "landmark", None)
         if source is None:
             return ()
-
         retained: list[tuple[int, OverlayPoint]] = []
         for source_index, output_index in POSE_SOURCE_TO_OUTPUT.items():
             if source_index >= len(source):
@@ -166,11 +236,15 @@ class HolisticExtractor:
     def close(self) -> None:
         if self._closed:
             return
-        close = getattr(self._model, "close", None)
-        if close is not None:
-            close()
         self._closed = True
-        self._last_results = None
+        try:
+            self._tracker_pool.shutdown(wait=True, cancel_futures=True)
+        finally:
+            try:
+                self.pose_tracker.close()
+            finally:
+                self.hand_tracker.close()
+                self._last_results = None
 
     def __enter__(self: _ExtractorT) -> _ExtractorT:
         return self
@@ -194,4 +268,9 @@ def _finite_point_or_nan(landmark: Any) -> OverlayPoint:
     return OverlayPoint(float(values[0]), float(values[1]), float(values[2]))
 
 
-__all__ = ["HolisticExtractor", "OverlayPoint", "RestrictedHolisticResults"]
+HolisticExtractor = PoseHandsExtractor
+
+__all__ = [
+    "PoseHandsExtractor", "HolisticExtractor", "OverlayPoint",
+    "RestrictedPoseHandsResults", "RestrictedHolisticResults",
+]

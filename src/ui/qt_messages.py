@@ -28,6 +28,8 @@ def map_telemetry(
     fusion_mode = str(telemetry.get("fusion_status", "Fallback"))
     fusion_ok = fusion_mode.casefold() == "triangulated"
     fps = max(0.0, float(telemetry.get("fps", 0.0)))
+    capture_fps = telemetry.get("capture_fps")
+    latency_ms = telemetry.get("inference_latency_ms")
     confidence_percent = round(max(0.0, min(1.0, confidence)) * 100)
     return TelemetryDisplay(
         sync_text=(
@@ -44,7 +46,11 @@ def map_telemetry(
             else "Triangulated" if fusion_ok else "Fallback"
         ),
         fusion_ok=fusion_ok,
-        fps_text=f"{fps:.1f} FPS",
+        fps_text=(
+            f"Capture {float(capture_fps):.1f} | Extraction {fps:.1f} FPS"
+            + (f" | Inference {float(latency_ms):.1f} ms" if latency_ms is not None else "")
+            if capture_fps is not None else f"{fps:.1f} FPS"
+        ),
         confidence_percent=confidence_percent,
     )
 

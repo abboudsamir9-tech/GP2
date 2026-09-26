@@ -106,6 +106,49 @@ def test_active_hand_with_long_gap_is_not_imputed(app) -> None:
     assert np.isnan(cleaned[10:15, 0:63]).all()
 
 
+def test_live_inference_cadence_emits_at_45_then_51_valid_frames(app) -> None:
+    preprocessor = PreprocessingPipeline()
+    buffer = SlidingWindowBuffer(stride=6)
+    frame = make_landmark_frame()
+    emitted: list[int] = []
+    for index in range(1, 52):
+        if buffer.append_landmarks(
+            frame, timestamp_ns=index, preprocessor=preprocessor
+        ) is not None:
+            emitted.append(index)
+
+    assert emitted == [45, 51]
+
+
+def test_display_loop_publishes_frames_without_vision_processing(app, monkeypatch) -> None:
+    worker = PipelineWorker(RuntimeSettings())
+    published: list[np.ndarray] = []
+
+    class FakeCamera:
+        def __init__(self) -> None:
+            self.index = 0
+
+        def peek_latest_frame(self) -> TimestampedFrame:
+            self.index += 1
+            return TimestampedFrame(
+                camera_id="front",
+                frame_index=self.index,
+                timestamp_ns=self.index,
+                frame_buffer=np.zeros((100, 100, 3), dtype=np.uint8),
+                health_meta={},
+            )
+
+    def publish(front: np.ndarray, side: np.ndarray) -> None:
+        published.append(front)
+        if len(published) == 4:
+            worker.stop()
+
+    monkeypatch.setattr(worker, "_publish_frames", publish)
+    worker._display_loop(FakeCamera())
+
+    assert len(published) == 4
+
+
 def test_gui_threshold_accepts_and_emits_confident_prediction(app) -> None:
     class FakeEngine:
         class_map = {0: "HELLO", 1: "NO", 2: "YES"}

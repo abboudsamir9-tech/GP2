@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import argparse
 import sys
+import threading
 import time
 from contextlib import ExitStack
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
@@ -18,7 +20,7 @@ if str(SOURCE_ROOT) not in sys.path:
 
 from asl_stereo.capture import CameraWorker, Synchronizer  # noqa: E402
 from asl_stereo.contracts import LandmarkFrame, TimestampedFrame  # noqa: E402
-from asl_stereo.landmarks import HolisticExtractor, draw_asl_overlay  # noqa: E402
+from asl_stereo.landmarks import PoseHandsExtractor, draw_asl_overlay  # noqa: E402
 from asl_stereo.models import InferenceEngine, SignSequenceClassifier  # noqa: E402
 from asl_stereo.models.checkpoint import load_class_map  # noqa: E402
 from asl_stereo.preprocessing import PreprocessingPipeline, SlidingWindowBuffer  # noqa: E402
@@ -28,6 +30,7 @@ WINDOW_TITLE = "ASL Live Test"
 CAPTURE_RESOLUTION = (1280, 720)
 DISPLAY_RESOLUTION = (640, 360)
 REQUESTED_FPS = 60.0
+INFERENCE_STRIDE = 6
 CAMERA_INDICES = (0, 1, 2)
 NO_FRAME_TIMEOUT_S = 5.0
 NO_PAIR_TIMEOUT_S = 3.0
@@ -73,6 +76,23 @@ class FpsMeter:
         return self.fps
 
 
+@dataclass(slots=True)
+class LiveState:
+    """Small, lock-protected handoff from vision to the display loop."""
+
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    side_camera: CameraWorker | None = None
+    front_landmarks: LandmarkFrame | None = None
+    front_results: object = None
+    side_landmarks: LandmarkFrame | None = None
+    side_results: object = None
+    extraction_fps: float = 0.0
+    last_gloss: str = "--"
+    last_confidence: float = 0.0
+    last_latency_ms: float = 0.0
+    last_status: str = "BUFFERING"
+
+
 class LiveWindowPreprocessor:
     """Match training's neutral pose for a hand absent for a whole window."""
 
@@ -80,17 +100,13 @@ class LiveWindowPreprocessor:
         self.pipeline = PreprocessingPipeline()
 
     def process_live_window(self, raw_window: np.ndarray) -> np.ndarray:
-        cleaned = self.pipeline.process_live_window(raw_window)
-        for joint_slice, feature_slice in (
-            (slice(0, 21), slice(0, 63)),
-            (slice(21, 42), slice(63, 126)),
-        ):
-            if np.isnan(raw_window[:, joint_slice, :]).all():
-                cleaned[:, feature_slice] = np.float32(0.0)
-        return cleaned
+        return self.pipeline.process_live_window(raw_window)
 
 
 def _load_engine(weights_path: Path | None, class_map_path: Path) -> InferenceEngine:
+    import torch
+
+    torch.set_num_threads(1)
     class_map = load_class_map(class_map_path)
     candidates = [weights_path] if weights_path is not None else [
         PROJECT_ROOT / "weights" / "optimized_model.pt",
@@ -143,49 +159,53 @@ def _open_camera(
 ) -> tuple[CameraWorker, int, TimestampedFrame]:
     failures: list[str] = []
     for index in _camera_candidates(preferred, excluded or set()):
-        camera: CameraWorker | None = None
-        try:
-            camera = camera_factory(
-                index, camera_id=camera_id,
-                resolution=CAPTURE_RESOLUTION, target_fps=REQUESTED_FPS,
-            )
-            camera.start(timeout=5.0)
-            first = camera.get_frame(timeout=1.5)
-            if (
-                first is None
-                or first.frame_buffer.size == 0
-                or first.frame_buffer.ndim != 3
-                or first.frame_buffer.shape[2] != 3
-            ):
-                raise RuntimeError("no non-empty frame after warmup")
-            if not camera.is_running:
-                raise RuntimeError(f"capture stopped: {camera.last_error!r}")
-        except Exception as error:
-            reason = error.__cause__ or error
-            failures.append(f"index {index}: {reason}")
-            print(f"[WARNING] Camera index {index} unavailable: {reason}", flush=True)
-            if camera is not None:
-                _stop_camera(camera)
-            continue
+        for attempt in (1, 2):
+            camera: CameraWorker | None = None
+            try:
+                camera = camera_factory(
+                    index, camera_id=camera_id,
+                    resolution=CAPTURE_RESOLUTION, target_fps=REQUESTED_FPS,
+                )
+                camera.start(timeout=5.0)
+                first = camera.get_frame(timeout=1.5)
+                if (
+                    first is None
+                    or first.frame_buffer.size == 0
+                    or first.frame_buffer.ndim != 3
+                    or first.frame_buffer.shape[2] != 3
+                ):
+                    raise RuntimeError("no non-empty frame after warmup")
+                if not camera.is_running:
+                    raise RuntimeError(f"capture stopped: {camera.last_error!r}")
+            except Exception as error:
+                reason = error.__cause__ or error
+                if camera is not None:
+                    _stop_camera(camera)
+                if isinstance(reason, TimeoutError) and attempt == 1:
+                    print(f"[WARNING] Camera index {index} timed out; retrying", flush=True)
+                    continue
+                failures.append(f"index {index}: {reason}")
+                print(f"[WARNING] Camera index {index} unavailable: {reason}", flush=True)
+                break
 
-        stack.callback(_stop_camera, camera)
-        height, width = first.frame_buffer.shape[:2]
-        actual_fps = camera.actual_fps
-        fps_text = f"{actual_fps:.1f}" if actual_fps is not None else "unknown"
-        print(
-            f"[INFO] Successfully opened camera at index {index} "
-            f"at {width}x{height} @ {fps_text} FPS",
-            flush=True,
-        )
-        if actual_fps is None:
-            print("[WARNING] Driver did not report FPS; requested 60 FPS.", flush=True)
-        elif actual_fps < REQUESTED_FPS - 0.5:
+            stack.callback(_stop_camera, camera)
+            height, width = first.frame_buffer.shape[:2]
+            actual_fps = camera.actual_fps
+            fps_text = f"{actual_fps:.1f}" if actual_fps is not None else "unknown"
             print(
-                f"[WARNING] Hardware capped at {actual_fps:.1f} FPS. "
-                "Continuing with available rate.",
+                f"[INFO] Successfully opened camera at index {index} "
+                f"at {width}x{height} @ {fps_text} FPS",
                 flush=True,
             )
-        return camera, index, first
+            if actual_fps is None:
+                print("[WARNING] Driver did not report FPS; requested 60 FPS.", flush=True)
+            elif actual_fps < REQUESTED_FPS - 0.5:
+                print(
+                    f"[WARNING] Hardware capped at {actual_fps:.1f} FPS. "
+                    "Continuing with available rate.",
+                    flush=True,
+                )
+            return camera, index, first
     raise RuntimeError(f"No usable {camera_id} camera: {'; '.join(failures)}")
 
 
@@ -235,6 +255,7 @@ def _report_prediction(
     preprocessor: LiveWindowPreprocessor,
     engine: InferenceEngine,
     confidence_threshold: float,
+    state: LiveState,
 ) -> None:
     pose_visible = bool(np.isfinite(coordinates[42:46]).all())
     hand_visible = bool(landmarks.hand_present.any())
@@ -246,21 +267,12 @@ def _report_prediction(
     if not pose_visible or not hand_visible:
         if frame_count % 30 == 0:
             print(
-                f"[FPS: {fps:.1f}] Waiting for signer framing "
+                f"[Extraction: {fps:.1f} FPS] Waiting for signer framing "
                 "(shoulders, elbows, and at least one hand required)...",
                 flush=True,
             )
         return
     if window is None:
-        state = (
-            f"BUFFERING ({buffer.raw_frame_count}/45)"
-            if buffer.raw_frame_count < 45 else "WAITING_VALID_WINDOW"
-        )
-        print(
-            f"[FPS: {fps:.1f}] Landmark Lock: YES | Prediction: -- | "
-            f"Conf: 0.00 | Status: {state}",
-            flush=True,
-        )
         return
 
     result = engine.predict(window)
@@ -271,8 +283,14 @@ def _report_prediction(
     )
     gloss = result.predicted_gloss if result.confidence_score >= confidence_threshold else "--"
     status = "ACCEPTED" if decision.accepted else "LOW_CONF"
+    with state.lock:
+        state.last_latency_ms = result.latency_ms
+        state.last_status = status
+        if decision.accepted:
+            state.last_gloss = result.predicted_gloss
+            state.last_confidence = result.confidence_score
     print(
-        f"[FPS: {fps:.1f}] Landmark Lock: YES | Prediction: {gloss} | "
+        f"[Extraction: {fps:.1f} FPS] Landmark Lock: YES | Prediction: {gloss} | "
         f"Conf: {result.confidence_score:.2f} | Status: {status} "
         f"| Inference: {result.latency_ms:.1f} ms",
         flush=True,
@@ -296,9 +314,6 @@ def run(
         raise ValueError("confidence threshold must be in [0, 1]")
 
     engine = _load_engine(weights_path, class_map_path)
-    meter = FpsMeter()
-    preprocessor = LiveWindowPreprocessor()
-    buffer = SlidingWindowBuffer(window_size=45, stride=8)
     with ExitStack() as stack:
         front, selected_front, first_front = _open_camera(
             stack, front_index, camera_id="front"
@@ -312,8 +327,6 @@ def run(
                 )
             except RuntimeError as error:
                 print(f"[WARNING] {error}. Entering single-camera mode.", flush=True)
-        front_extractor = stack.enter_context(HolisticExtractor())
-        side_extractor = stack.enter_context(HolisticExtractor()) if side else None
         calibration = StereoCalibration()
         if side is not None:
             try:
@@ -326,25 +339,68 @@ def run(
                     "Using front-camera coordinates.",
                     flush=True,
                 )
-        matcher = StereoMatcher(calibration, fallback_scope="frame")
-        synchronizer = Synchronizer()
-        last_frame_time = time.monotonic()
-        last_pair_time = last_frame_time
-        frame_count = 0
+        state = LiveState(side_camera=side)
+        stop_event = threading.Event()
+        errors: list[Exception] = []
+        vision = threading.Thread(
+            target=_vision_loop,
+            args=(front, side, first_front, first_side, calibration, engine,
+                  confidence_threshold, state, stop_event, errors),
+            name="asl-live-vision",
+            daemon=True,
+        )
+        vision.start()
+        try:
+            _display_loop(front, state, stop_event)
+        finally:
+            stop_event.set()
+            vision.join(timeout=5.0)
+        if errors:
+            raise errors[0]
 
-        while front.is_running:
-            if side is not None and not side.is_running:
-                print("[WARNING] Side camera stopped. Entering single-camera mode.", flush=True)
-                side = None
-                buffer.reset()
 
-            if side is None:
-                record = first_front or front.get_frame(timeout=0.05)
-                first_front = None
-                if record is None:
-                    if time.monotonic() - last_frame_time > NO_FRAME_TIMEOUT_S:
-                        raise RuntimeError("front camera stopped delivering frames")
-                else:
+def _vision_loop(
+    front: CameraWorker,
+    side: CameraWorker | None,
+    first_front: TimestampedFrame,
+    first_side: TimestampedFrame | None,
+    calibration: StereoCalibration,
+    engine: InferenceEngine,
+    confidence_threshold: float,
+    state: LiveState,
+    stop_event: threading.Event,
+    errors: list[Exception],
+) -> None:
+    try:
+        with ExitStack() as extractors:
+            front_extractor = extractors.enter_context(PoseHandsExtractor())
+            side_extractor = extractors.enter_context(PoseHandsExtractor()) if side else None
+            meter = FpsMeter()
+            preprocessor = LiveWindowPreprocessor()
+            buffer = SlidingWindowBuffer(window_size=45, stride=INFERENCE_STRIDE)
+            matcher = StereoMatcher(calibration, fallback_scope="frame")
+            synchronizer = Synchronizer()
+            last_frame_time = time.monotonic()
+            last_pair_time = last_frame_time
+            frame_count = 0
+
+            while front.is_running and not stop_event.is_set():
+                if side is not None and not side.is_running:
+                    print("[WARNING] Side camera stopped. Entering single-camera mode.", flush=True)
+                    side = None
+                    with state.lock:
+                        state.side_camera = None
+                        state.side_landmarks = None
+                        state.side_results = None
+                    buffer.reset()
+
+                if side is None:
+                    record = first_front or front.get_frame(timeout=0.01)
+                    first_front = None
+                    if record is None:
+                        if time.monotonic() - last_frame_time > NO_FRAME_TIMEOUT_S:
+                            raise RuntimeError("front camera stopped delivering frames")
+                        continue
                     last_frame_time = time.monotonic()
                     landmarks = front_extractor.process(
                         record.frame_buffer,
@@ -352,21 +408,21 @@ def run(
                         frame_index=record.frame_index,
                     )
                     fps = meter.tick()
-                    display = annotate_frame(
-                        record.frame_buffer, landmarks, front_extractor.last_results,
-                        camera_name="FRONT", fps=fps,
-                    )
-                    cv2.imshow(WINDOW_TITLE, cv2.resize(display, DISPLAY_RESOLUTION))
+                    with state.lock:
+                        state.front_landmarks = landmarks
+                        state.front_results = front_extractor.last_results
+                        state.extraction_fps = fps
                     _report_prediction(
                         landmarks, landmarks.coordinates, fps=fps,
                         frame_count=frame_count, buffer=buffer,
                         preprocessor=preprocessor, engine=engine,
-                        confidence_threshold=confidence_threshold,
+                        confidence_threshold=confidence_threshold, state=state,
                     )
                     frame_count += 1
-            else:
-                front_record = first_front or front.get_frame(timeout=0.05)
-                side_record = first_side or side.get_frame(timeout=0.05)
+                    continue
+
+                front_record = first_front or front.get_frame(timeout=0.01)
+                side_record = first_side or side.get_frame(timeout=0.01)
                 first_front = None
                 first_side = None
                 pair = None
@@ -391,21 +447,12 @@ def run(
                         frame_index=pair.side.frame_index,
                     )
                     fps = meter.tick()
-                    delta_ms = pair.delta_t_ns / 1_000_000.0
-                    front_display = annotate_frame(
-                        pair.front.frame_buffer, front_landmarks,
-                        front_extractor.last_results, camera_name="FRONT",
-                        fps=fps, sync_delta_ms=delta_ms,
-                    )
-                    side_display = annotate_frame(
-                        pair.side.frame_buffer, side_landmarks,
-                        side_extractor.last_results, camera_name="SIDE",
-                        fps=fps, sync_delta_ms=delta_ms,
-                    )
-                    cv2.imshow(WINDOW_TITLE, np.hstack((
-                        cv2.resize(front_display, DISPLAY_RESOLUTION),
-                        cv2.resize(side_display, DISPLAY_RESOLUTION),
-                    )))
+                    with state.lock:
+                        state.front_landmarks = front_landmarks
+                        state.front_results = front_extractor.last_results
+                        state.side_landmarks = side_landmarks
+                        state.side_results = side_extractor.last_results
+                        state.extraction_fps = fps
                     coordinates = front_landmarks.coordinates
                     if calibration.available:
                         coordinates = matcher.match(
@@ -419,7 +466,7 @@ def run(
                         front_landmarks, coordinates, fps=fps,
                         frame_count=frame_count, buffer=buffer,
                         preprocessor=preprocessor, engine=engine,
-                        confidence_threshold=confidence_threshold,
+                        confidence_threshold=confidence_threshold, state=state,
                     )
                     frame_count += 1
                 elif time.monotonic() - last_pair_time > NO_PAIR_TIMEOUT_S:
@@ -427,15 +474,91 @@ def run(
                           flush=True)
                     _stop_camera(side)
                     side = None
+                    with state.lock:
+                        state.side_camera = None
+                        state.side_landmarks = None
+                        state.side_results = None
                     buffer.reset()
                 if time.monotonic() - last_frame_time > NO_FRAME_TIMEOUT_S:
                     raise RuntimeError("front camera stopped delivering frames")
+            if not stop_event.is_set():
+                raise RuntimeError(f"front camera stopped: {front.last_error!r}")
+    except Exception as error:
+        errors.append(error)
+        stop_event.set()
 
-            if cv2.waitKey(1) & 0xFF == ord("q"):
-                print("[INFO] Quit requested.", flush=True)
-                break
-        else:
-            raise RuntimeError(f"front camera stopped: {front.last_error!r}")
+
+def _display_loop(front: CameraWorker, state: LiveState, stop_event: threading.Event) -> None:
+    import cv2
+
+    next_display_at = time.perf_counter()
+    last_front_index = -1
+    last_side_index = -1
+    last_report_at = 0.0
+    while not stop_event.is_set():
+        now = time.perf_counter()
+        if now < next_display_at and stop_event.wait(next_display_at - now):
+            break
+        next_display_at = max(next_display_at + 1.0 / 60.0, time.perf_counter())
+        front_record = front.peek_latest_frame()
+        with state.lock:
+            side_camera = state.side_camera
+            front_landmarks = state.front_landmarks
+            front_results = state.front_results
+            side_landmarks = state.side_landmarks
+            side_results = state.side_results
+            extraction_fps = state.extraction_fps
+            latency_ms = state.last_latency_ms
+            last_gloss = state.last_gloss
+            last_confidence = state.last_confidence
+            last_status = state.last_status
+        side_record = side_camera.peek_latest_frame() if side_camera is not None else None
+        capture_fps = front.capture_fps
+        if front_record is not None:
+            side_index = side_record.frame_index if side_record is not None else -1
+            if (front_record.frame_index, side_index) != (last_front_index, last_side_index):
+                last_front_index, last_side_index = front_record.frame_index, side_index
+                if front_landmarks is None:
+                    front_landmarks = LandmarkFrame.missing(
+                        timestamp_ns=front_record.timestamp_ns,
+                        frame_index=front_record.frame_index,
+                    )
+                front_display = annotate_frame(
+                    cv2.resize(front_record.frame_buffer, DISPLAY_RESOLUTION),
+                    front_landmarks, front_results,
+                    camera_name="FRONT", fps=capture_fps,
+                )
+                cv2.putText(
+                    front_display,
+                    f"Last: {last_gloss} ({last_confidence:.2f}) | {last_status}",
+                    (12, 112), cv2.FONT_HERSHEY_SIMPLEX, 0.54,
+                    (0, 215, 255), 2, cv2.LINE_AA,
+                )
+                if side_record is None:
+                    cv2.imshow(WINDOW_TITLE, front_display)
+                else:
+                    if side_landmarks is None:
+                        side_landmarks = LandmarkFrame.missing(
+                            timestamp_ns=side_record.timestamp_ns,
+                            frame_index=side_record.frame_index,
+                        )
+                    side_display = annotate_frame(
+                        cv2.resize(side_record.frame_buffer, DISPLAY_RESOLUTION),
+                        side_landmarks, side_results,
+                        camera_name="SIDE", fps=side_camera.capture_fps,
+                    )
+                    cv2.imshow(WINDOW_TITLE, np.hstack((front_display, side_display)))
+        if now - last_report_at >= 1.0:
+            print(
+                f"[Capture: {capture_fps:.1f} FPS | "
+                f"Extraction: {extraction_fps:.1f} FPS | "
+                f"Inference Latency: {latency_ms:.1f} ms]",
+                flush=True,
+            )
+            last_report_at = now
+        if cv2.waitKey(1) & 0xFF == ord("q"):
+            print("[INFO] Quit requested.", flush=True)
+            break
 
 
 def main() -> int:

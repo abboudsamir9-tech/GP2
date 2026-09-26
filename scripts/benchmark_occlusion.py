@@ -23,7 +23,7 @@ from asl_stereo.evaluation import (  # noqa: E402
     reduction_percent,
     tracking_metrics,
 )
-from asl_stereo.landmarks import HolisticExtractor  # noqa: E402
+from asl_stereo.landmarks import PoseHandsExtractor  # noqa: E402
 from asl_stereo.models import (  # noqa: E402
     InferenceEngine,
     SignSequenceClassifier,
@@ -180,7 +180,7 @@ def extract_video_tracks(
     fused_frames: list[np.ndarray] = []
     status_frames: list[list[str]] = []
     try:
-        with HolisticExtractor() as baseline_extractor, HolisticExtractor() as front_extractor, HolisticExtractor() as side_extractor:
+        with PoseHandsExtractor() as baseline_extractor, PoseHandsExtractor() as front_extractor, PoseHandsExtractor() as side_extractor:
             frame_index = 0
             while True:
                 front_ok, front_frame = front_capture.read()

@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections import deque
 from collections.abc import Callable, MutableMapping
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -12,7 +13,7 @@ from typing import Any
 
 import numpy as np
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, pyqtSlot
-from PyQt5.QtGui import QCloseEvent, QImage, QPixmap
+from PyQt5.QtGui import QCloseEvent
 from PyQt5.QtWidgets import (
     QDialog,
     QDialogButtonBox,
@@ -32,7 +33,7 @@ from PyQt5.QtWidgets import (
 
 from asl_stereo.capture import CameraWorker, DropReason, Synchronizer, SyncWatchdog
 from asl_stereo.contracts import TimestampedFrame
-from asl_stereo.landmarks import HolisticExtractor, draw_asl_overlay
+from asl_stereo.landmarks import PoseHandsExtractor, draw_asl_overlay
 from asl_stereo.models import InferenceEngine, SignSequenceClassifier
 from asl_stereo.models.checkpoint import load_class_map
 from asl_stereo.preprocessing import PreprocessingPipeline, SlidingWindowBuffer
@@ -41,6 +42,7 @@ from asl_stereo.translation.confidence_filter import ConfidenceFilter
 
 from .qt_messages import map_telemetry, prediction_text
 from .text_ticker import TranslationTicker
+from .video_widget import VideoWidget
 
 LOGGER = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -49,6 +51,8 @@ CAMERA_RESOLUTION = (1280, 720)
 CAMERA_FPS = 60.0
 CAMERA_TIMEOUT_S = 5.0
 GUI_MIN_CONFIDENCE = 0.35
+INFERENCE_STRIDE = 6
+DISPLAY_INTERVAL_S = 1.0 / 60.0
 
 
 @dataclass(slots=True)
@@ -73,7 +77,7 @@ class PipelineWorker(QThread):
         inference_engine: InferenceEngine | None = None,
         calibration: StereoCalibration | None = None,
         camera_factory: Callable[..., CameraWorker] = CameraWorker,
-        extractor_factory: Callable[..., HolisticExtractor] = HolisticExtractor,
+        extractor_factory: Callable[..., PoseHandsExtractor] = PoseHandsExtractor,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -93,6 +97,15 @@ class PipelineWorker(QThread):
         self._frame_mailbox_lock = threading.Lock()
         self._latest_frames: tuple[np.ndarray, np.ndarray] | None = None
         self._frame_signal_pending = False
+        self._overlay_lock = threading.Lock()
+        self._front_overlay_results: Any = None
+        self._side_overlay_results: Any = None
+        self._extraction_times: deque[float] = deque(maxlen=45)
+        self._extraction_fps = 0.0
+        self._last_telemetry_at = 0.0
+        self._last_console_at = 0.0
+        self._last_confirmed_confidence = 0.0
+        self._last_inference_latency_ms = 0.0
 
     def update_confidence_threshold(self, value: float) -> None:
         if not 0.0 <= value <= 1.0:
@@ -169,6 +182,11 @@ class PipelineWorker(QThread):
     def _load_default_engine(self) -> None:
         if self.inference_engine is not None:
             return
+        import torch
+
+        # INT8 LSTM latency rises sharply when Torch oversubscribes the CPU
+        # alongside MediaPipe and the independent camera producer.
+        torch.set_num_threads(1)
         class_map = load_class_map(PROJECT_ROOT / "configs" / "class_map.json")
         failures: list[str] = []
         for artifact in (
@@ -195,37 +213,35 @@ class PipelineWorker(QThread):
     def run(self) -> None:
         front_camera: CameraWorker | None = None
         side_camera: CameraWorker | None = None
-        front_extractor: HolisticExtractor | None = None
-        side_extractor: HolisticExtractor | None = None
+        vision_thread: threading.Thread | None = None
         try:
             self._load_default_engine()
-            synchronizer = Synchronizer(front_camera_id="front", side_camera_id="side")
-            watchdog = SyncWatchdog(purge_callback=synchronizer.purge)
-            matcher = StereoMatcher(self.calibration, fallback_scope="frame")
-            preprocessor = PreprocessingPipeline()
-            window_buffer = SlidingWindowBuffer()
-
             candidates = list(dict.fromkeys((self.settings.front_camera_index, *CAMERA_INDICES)))
             camera_failures: list[str] = []
             first_front = None
             selected_front = None
             for index in candidates:
-                if self._stop_event.is_set():
-                    return
-                try:
-                    front_camera, first_front = self._open_camera(index, "front")
-                except Exception as error:
-                    reason = error.__cause__ or error
-                    camera_failures.append(f"index {index}: {reason}")
-                    print(f"[GUI WARNING] Front camera index {index}: {reason}", flush=True)
-                    continue
-                selected_front = index
-                break
+                for attempt in (1, 2):
+                    if self._stop_event.is_set():
+                        return
+                    try:
+                        front_camera, first_front = self._open_camera(index, "front")
+                    except Exception as error:
+                        reason = error.__cause__ or error
+                        if isinstance(reason, TimeoutError) and attempt == 1:
+                            print(f"[GUI WARNING] Camera index {index} timed out; retrying", flush=True)
+                            continue
+                        camera_failures.append(f"index {index}: {reason}")
+                        print(f"[GUI WARNING] Front camera index {index}: {reason}", flush=True)
+                        break
+                    selected_front = index
+                    break
+                if front_camera is not None:
+                    break
             if front_camera is None:
                 raise RuntimeError("No working front camera. " + "; ".join(camera_failures))
             with self._resource_lock:
                 self._front_camera = front_camera
-            front_extractor = self._extractor_factory()
 
             first_side = None
             if self.settings.side_camera_index != selected_front:
@@ -235,7 +251,6 @@ class PipelineWorker(QThread):
                     )
                     with self._resource_lock:
                         self._side_camera = side_camera
-                    side_extractor = self._extractor_factory()
                 except Exception as error:
                     LOGGER.warning("Side camera unavailable: %s", error)
                     print(f"[GUI WARNING] Side camera unavailable: {error}", flush=True)
@@ -250,22 +265,61 @@ class PipelineWorker(QThread):
                 with self._resource_lock:
                     self._side_camera = None
 
+            vision_thread = threading.Thread(
+                target=self._vision_loop,
+                args=(front_camera, side_camera, first_front, first_side),
+                name="asl-vision-worker",
+                daemon=True,
+            )
+            vision_thread.start()
+            self._display_loop(front_camera)
+        except Exception as error:
+            if not self._stop_event.is_set():
+                LOGGER.exception("GUI pipeline failed")
+                print(f"[GUI ERROR] {type(error).__name__}: {error}", flush=True)
+                self.error_occurred.emit(f"{type(error).__name__}: {error}")
+        finally:
+            self._stop_event.set()
+            if vision_thread is not None:
+                vision_thread.join(timeout=5.0)
+            for camera in (front_camera, side_camera):
+                if camera is not None:
+                    try:
+                        camera.stop()
+                    except Exception as error:
+                        self.error_occurred.emit(f"Camera shutdown: {error}")
+            with self._resource_lock:
+                self._front_camera = None
+                self._side_camera = None
+
+    def _vision_loop(
+        self,
+        front_camera: CameraWorker,
+        side_camera: CameraWorker | None,
+        first_front: TimestampedFrame,
+        first_side: TimestampedFrame | None,
+    ) -> None:
+        front_extractor: PoseHandsExtractor | None = None
+        side_extractor: PoseHandsExtractor | None = None
+        try:
+            front_extractor = self._extractor_factory()
+            side_extractor = self._extractor_factory() if side_camera is not None else None
+            synchronizer = Synchronizer(front_camera_id="front", side_camera_id="side")
+            watchdog = SyncWatchdog(purge_callback=synchronizer.purge)
+            matcher = StereoMatcher(self.calibration, fallback_scope="frame")
+            preprocessor = PreprocessingPipeline()
+            window_buffer = SlidingWindowBuffer(stride=INFERENCE_STRIDE)
             frame_count = 0
             fps_started = time.perf_counter()
             last_front_time = time.monotonic()
             last_pair_time = last_front_time
             previous_sync_rejects = 0
-            while not self._stop_event.is_set() and not self.isInterruptionRequested():
+
+            while not self._stop_event.is_set():
                 if not front_camera.is_running:
                     raise RuntimeError(f"front camera stopped: {front_camera.last_error!r}")
                 if side_camera is not None and not side_camera.is_running:
-                    LOGGER.warning(
-                        "Side camera stopped; entering single-camera fallback"
-                    )
-                    try:
-                        side_camera.stop()
-                    except Exception:
-                        LOGGER.debug("Side-camera cleanup failed", exc_info=True)
+                    LOGGER.warning("Side camera stopped; entering single-camera fallback")
                     side_camera = None
                     if side_extractor is not None:
                         side_extractor.close()
@@ -278,34 +332,29 @@ class PipelineWorker(QThread):
                         self._side_camera = None
 
                 if side_camera is None:
-                    front_frame = first_front or front_camera.get_frame()
+                    front_frame = first_front or front_camera.get_frame(timeout=0.01)
                     first_front = None
                     if front_frame is None:
                         if time.monotonic() - last_front_time > CAMERA_TIMEOUT_S:
                             raise RuntimeError("front camera stopped delivering frames")
-                        self.msleep(1)
                         continue
                     last_front_time = time.monotonic()
                     self._process_single_frame(
-                        front_frame,
-                        front_extractor,
-                        preprocessor,
-                        window_buffer,
-                        frame_count,
-                        fps_started,
+                        front_frame, front_extractor, preprocessor,
+                        window_buffer, frame_count, fps_started,
                     )
                     frame_count += 1
                     continue
 
                 pairs = []
-                front_frame = first_front or front_camera.get_frame()
+                front_frame = first_front or front_camera.get_frame(timeout=0.01)
                 first_front = None
                 if front_frame is not None:
                     last_front_time = time.monotonic()
                     pair = synchronizer.add_front(front_frame)
                     if pair is not None:
                         pairs.append(pair)
-                side_frame = first_side or side_camera.get_frame()
+                side_frame = first_side or side_camera.get_frame(timeout=0.01)
                 first_side = None
                 if side_frame is not None:
                     pair = synchronizer.add_side(side_frame)
@@ -322,15 +371,9 @@ class PipelineWorker(QThread):
                     watchdog.record_frame()
                     watchdog.next_pair_index()
                     self._process_pair(
-                        pair,
-                        front_extractor,
-                        side_extractor,
-                        matcher,
-                        preprocessor,
-                        window_buffer,
-                        watchdog,
-                        frame_count,
-                        fps_started,
+                        pair, front_extractor, side_extractor, matcher,
+                        preprocessor, window_buffer, watchdog,
+                        frame_count, fps_started,
                     )
                     frame_count += 1
 
@@ -344,11 +387,8 @@ class PipelineWorker(QThread):
                     if time.monotonic() - last_front_time > CAMERA_TIMEOUT_S:
                         raise RuntimeError("front camera stopped delivering frames")
                     if time.monotonic() - last_pair_time > 3.0:
-                        print(
-                            "[GUI WARNING] No synchronized pairs; entering "
-                            "[SINGLE-CAMERA FALLBACK]",
-                            flush=True,
-                        )
+                        print("[GUI WARNING] No synchronized pairs; entering "
+                              "[SINGLE-CAMERA FALLBACK]", flush=True)
                         try:
                             side_camera.stop()
                         except Exception:
@@ -363,32 +403,54 @@ class PipelineWorker(QThread):
                         self._invalid_window_count = 0
                         with self._resource_lock:
                             self._side_camera = None
-                        continue
-                    self.msleep(1)
         except Exception as error:
             if not self._stop_event.is_set():
-                LOGGER.exception("GUI pipeline failed")
-                print(f"[GUI ERROR] {type(error).__name__}: {error}", flush=True)
+                LOGGER.exception("Vision worker failed")
                 self.error_occurred.emit(f"{type(error).__name__}: {error}")
+                self._stop_event.set()
         finally:
             for extractor in (front_extractor, side_extractor):
                 if extractor is not None:
                     extractor.close()
-            for camera in (front_camera, side_camera):
-                if camera is not None:
-                    try:
-                        camera.stop()
-                    except Exception as error:
-                        self.error_occurred.emit(f"Camera shutdown: {error}")
+
+    def _display_loop(self, front_camera: CameraWorker) -> None:
+        import cv2
+
+        next_display_at = time.perf_counter()
+        last_front_index = -1
+        last_side_index = -1
+        while not self._stop_event.is_set() and not self.isInterruptionRequested():
+            now = time.perf_counter()
+            if now < next_display_at and self._stop_event.wait(next_display_at - now):
+                break
+            next_display_at = max(next_display_at + DISPLAY_INTERVAL_S, time.perf_counter())
+            front = front_camera.peek_latest_frame()
+            if front is None:
+                continue
             with self._resource_lock:
-                self._front_camera = None
-                self._side_camera = None
+                side_camera = self._side_camera
+            side = side_camera.peek_latest_frame() if side_camera is not None else None
+            side_index = side.frame_index if side is not None else -1
+            if front.frame_index == last_front_index and side_index == last_side_index:
+                continue
+            last_front_index, last_side_index = front.frame_index, side_index
+            with self._overlay_lock:
+                front_results = self._front_overlay_results
+                side_results = self._side_overlay_results
+            front_view = _preview_overlay(front.frame_buffer, front_results)
+            if side is None:
+                side_view = np.zeros_like(front_view)
+                cv2.putText(side_view, "[SINGLE-CAMERA FALLBACK]", (16, 180),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 215, 255), 2, cv2.LINE_AA)
+            else:
+                side_view = _preview_overlay(side.frame_buffer, side_results)
+            self._publish_frames(front_view, side_view)
 
     def _process_pair(
         self,
         pair,
-        front_extractor: HolisticExtractor,
-        side_extractor: HolisticExtractor,
+        front_extractor: PoseHandsExtractor,
+        side_extractor: PoseHandsExtractor,
         matcher: StereoMatcher,
         preprocessor: PreprocessingPipeline,
         window_buffer: SlidingWindowBuffer,
@@ -407,13 +469,9 @@ class PipelineWorker(QThread):
             frame_index=pair.side.frame_index,
         )
 
-        front_overlay = draw_asl_overlay(
-            pair.front.frame_buffer.copy(), front_extractor.last_results
-        )
-        side_overlay = draw_asl_overlay(
-            pair.side.frame_buffer.copy(), side_extractor.last_results
-        )
-        self._publish_frames(front_overlay, side_overlay)
+        with self._overlay_lock:
+            self._front_overlay_results = front_extractor.last_results
+            self._side_overlay_results = side_extractor.last_results
 
         front_pixels = _normalized_to_pixels(
             front_landmarks.coordinates, pair.front.frame_buffer.shape
@@ -433,12 +491,12 @@ class PipelineWorker(QThread):
         )
         confidence = self._run_inference(tensor, window_buffer)
 
-        elapsed = max(time.perf_counter() - fps_started, np.finfo(float).eps)
+        fps = self._record_extraction()
         triangulated = any(status is JointStatus.TRIANGULATED for status in fused.statuses)
         tracking = bool(front_landmarks.hand_presence.any())
-        self.telemetry_ready.emit(
+        self._publish_telemetry(
             {
-                "fps": (frame_count + 1) / elapsed,
+                "fps": fps,
                 "sync_delta_ms": pair.delta_t_ns / 1_000_000.0,
                 "watchdog_drop_rate": watchdog.drop_rate,
                 "fusion_status": "Triangulated" if triangulated else "Fallback",
@@ -450,34 +508,20 @@ class PipelineWorker(QThread):
     def _process_single_frame(
         self,
         frame,
-        front_extractor: HolisticExtractor,
+        front_extractor: PoseHandsExtractor,
         preprocessor: PreprocessingPipeline,
         window_buffer: SlidingWindowBuffer,
         frame_count: int,
         fps_started: float,
     ) -> None:
-        import cv2
-
         landmarks = front_extractor.process(
             frame.frame_buffer,
             timestamp_ns=frame.timestamp_ns,
             frame_index=frame.frame_index,
         )
-        front_overlay = draw_asl_overlay(
-            frame.frame_buffer.copy(), front_extractor.last_results
-        )
-        side_placeholder = np.zeros_like(front_overlay)
-        cv2.putText(
-            side_placeholder,
-            "[SINGLE-CAMERA FALLBACK]",
-            (20, max(40, side_placeholder.shape[0] // 2)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.75,
-            (0, 215, 255),
-            2,
-            cv2.LINE_AA,
-        )
-        self._publish_frames(front_overlay, side_placeholder)
+        with self._overlay_lock:
+            self._front_overlay_results = front_extractor.last_results
+            self._side_overlay_results = None
 
         tensor = window_buffer.append_landmarks(
             landmarks.coordinates,
@@ -485,10 +529,10 @@ class PipelineWorker(QThread):
             preprocessor=preprocessor,
         )
         confidence = self._run_inference(tensor, window_buffer)
-        elapsed = max(time.perf_counter() - fps_started, np.finfo(float).eps)
-        self.telemetry_ready.emit(
+        fps = self._record_extraction()
+        self._publish_telemetry(
             {
-                "fps": (frame_count + 1) / elapsed,
+                "fps": fps,
                 "sync_delta_ms": 0.0,
                 "watchdog_drop_rate": 0.0,
                 "fusion_status": "[SINGLE-CAMERA FALLBACK]",
@@ -497,6 +541,35 @@ class PipelineWorker(QThread):
                 "confidence": confidence,
             }
         )
+
+    def _record_extraction(self) -> float:
+        now = time.perf_counter()
+        self._extraction_times.append(now)
+        if len(self._extraction_times) > 1:
+            elapsed = self._extraction_times[-1] - self._extraction_times[0]
+            if elapsed > 0:
+                self._extraction_fps = (len(self._extraction_times) - 1) / elapsed
+        return self._extraction_fps
+
+    def _publish_telemetry(self, values: dict[str, Any]) -> None:
+        now = time.perf_counter()
+        with self._resource_lock:
+            front_camera = self._front_camera
+        capture_fps = front_camera.capture_fps if front_camera is not None else 0.0
+        values["capture_fps"] = capture_fps
+        values["extraction_fps"] = self._extraction_fps
+        values["inference_latency_ms"] = self._last_inference_latency_ms
+        if now - self._last_telemetry_at >= 0.2:
+            self.telemetry_ready.emit(values)
+            self._last_telemetry_at = now
+        if now - self._last_console_at >= 1.0:
+            print(
+                f"[Capture: {capture_fps:.1f} FPS | "
+                f"Extraction: {self._extraction_fps:.1f} FPS | "
+                f"Inference Latency: {self._last_inference_latency_ms:.1f} ms]",
+                flush=True,
+            )
+            self._last_console_at = now
 
     def _run_inference(
         self, tensor, window_buffer: SlidingWindowBuffer
@@ -520,11 +593,12 @@ class PipelineWorker(QThread):
                         "visible shoulders, elbows, and an active hand",
                         flush=True,
                     )
-            return 0.0
+            return self._last_confirmed_confidence
         if self.inference_engine is None:
             raise RuntimeError("Inference engine is not initialized")
         self._invalid_window_count = 0
         result = self.inference_engine.predict(tensor)
+        self._last_inference_latency_ms = result.latency_ms
         with self._threshold_lock:
             threshold = self._confidence_threshold
         labels = tuple(
@@ -548,6 +622,7 @@ class PipelineWorker(QThread):
             flush=True,
         )
         if decision.accepted:
+            self._last_confirmed_confidence = result.confidence_score
             print(
                 f"[GUI DEBUG] Emitting gloss signal: '{result.predicted_gloss}'",
                 flush=True,
@@ -555,7 +630,7 @@ class PipelineWorker(QThread):
             self.prediction_ready.emit(
                 result.predicted_gloss, result.confidence_score, result.latency_ms
             )
-        return result.confidence_score
+        return self._last_confirmed_confidence
 
 
 class SettingsDialog(QDialog):
@@ -633,6 +708,9 @@ class MainWindow(QMainWindow):
         self._worker_factory = worker_factory or (lambda value: PipelineWorker(value))
         self.worker: PipelineWorker | None = None
         self._last_confidence = 0.0
+        self._display_times: deque[float] = deque(maxlen=60)
+        self._display_fps = 0.0
+        self._last_display_log_at = 0.0
         self.setWindowTitle("Live ASL Stereo Translator")
         self.resize(1500, 850)
         self._build_ui()
@@ -708,7 +786,7 @@ class MainWindow(QMainWindow):
             QFrame#statusPanel, QFrame#bottomPanel {
                 background: #1B1B1B; border: 1px solid #454545; border-radius: 8px;
             }
-            QLabel#videoViewport {
+            QWidget#videoViewport {
                 background: #080808; border: 2px solid #5B5B5B; border-radius: 6px;
             }
             QLabel#statusBadge {
@@ -782,6 +860,15 @@ class MainWindow(QMainWindow):
                 front, side = latest
         _set_viewport_frame(self.front_view, front)
         _set_viewport_frame(self.side_view, side)
+        now = time.perf_counter()
+        self._display_times.append(now)
+        if len(self._display_times) > 1:
+            elapsed = self._display_times[-1] - self._display_times[0]
+            if elapsed > 0:
+                self._display_fps = (len(self._display_times) - 1) / elapsed
+        if now - self._last_display_log_at >= 1.0:
+            print(f"[GUI Display: {self._display_fps:.1f} FPS]", flush=True)
+            self._last_display_log_at = now
 
     @pyqtSlot(str, float, float)
     def _handle_prediction(self, gloss: str, confidence: float, latency_ms: float) -> None:
@@ -819,7 +906,7 @@ class MainWindow(QMainWindow):
             display.fusion_text,
             display.fusion_ok,
         )
-        self.fps_label.setText(display.fps_text)
+        self.fps_label.setText(f"{display.fps_text} | Display {self._display_fps:.1f} FPS")
         self.confidence_bar.setValue(display.confidence_percent)
 
     @pyqtSlot(str)
@@ -844,13 +931,13 @@ def _normalized_to_pixels(coordinates: np.ndarray, frame_shape: tuple[int, ...])
     return output
 
 
-def _video_panel(title: str) -> QLabel:
-    label = QLabel(title)
-    label.setObjectName("videoViewport")
-    label.setAlignment(Qt.AlignCenter)
-    label.setMinimumSize(420, 320)
-    label.setScaledContents(False)
-    return label
+def _preview_overlay(frame: np.ndarray, results: Any) -> np.ndarray:
+    """Annotate a full-resolution display copy without touching capture RAM."""
+    return frame if results is None else draw_asl_overlay(frame.copy(), results)
+
+
+def _video_panel(title: str) -> VideoWidget:
+    return VideoWidget(title)
 
 
 def _status_badge(title: str, value: str) -> QLabel:
@@ -865,16 +952,8 @@ def _set_badge(label: QLabel, title: str, value: str, healthy: bool) -> None:
     label.setText(f"{title}: <span style='color:{color}; font-weight:700'>{value}</span>")
 
 
-def _set_viewport_frame(label: QLabel, frame: np.ndarray) -> None:
-    if frame.dtype != np.uint8 or frame.ndim != 3 or frame.shape[2] != 3:
-        return
-    rgb = np.ascontiguousarray(frame[:, :, ::-1])
-    height, width, channels = rgb.shape
-    image = QImage(rgb.data, width, height, channels * width, QImage.Format_RGB888).copy()
-    pixmap = QPixmap.fromImage(image).scaled(
-        label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
-    )
-    label.setPixmap(pixmap)
+def _set_viewport_frame(label: VideoWidget, frame: np.ndarray) -> None:
+    label.set_frame(frame)
 
 
 def _config_get(configuration: RuntimeSettings | MutableMapping[str, Any], key: str) -> Any:

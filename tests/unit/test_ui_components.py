@@ -6,7 +6,7 @@ import pytest
 import numpy as np
 from PyQt5.QtWidgets import QApplication
 
-from ui import PipelineWorker, RuntimeSettings, SettingsDialog, TranslationTicker
+from ui import PipelineWorker, RuntimeSettings, SettingsDialog, TranslationTicker, VideoWidget
 from ui.qt_messages import map_telemetry
 
 
@@ -76,3 +76,20 @@ def test_single_camera_telemetry_is_explicit() -> None:
 
     assert display.sync_text == "[SINGLE-CAMERA FALLBACK]"
     assert display.fusion_text == "[SINGLE-CAMERA FALLBACK]"
+
+
+def test_video_widget_keeps_bgr_frame_without_copy(qt_application) -> None:
+    widget = VideoWidget("Front")
+    frame = np.zeros((8, 12, 3), dtype=np.uint8)
+    frame[0, 0] = (7, 11, 19)
+
+    widget.set_frame(frame)
+    widget.show()
+    qt_application.processEvents()
+
+    assert widget._frame is frame
+    assert widget._image is not None
+    assert widget._image.format() == widget._image.Format_BGR888
+    assert widget._image.width() == 12
+    assert widget._image.height() == 8
+    assert int(widget._image.constBits()) == frame.ctypes.data

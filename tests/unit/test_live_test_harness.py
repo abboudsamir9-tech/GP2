@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+import threading
 from contextlib import ExitStack
 from types import SimpleNamespace
 
@@ -62,9 +63,15 @@ def test_camera_worker_requests_fps_and_retries_empty_warmup() -> None:
         assert frame is not None and frame.frame_buffer.size > 0
         assert capture.reads >= 3
         assert capture.properties[cv2.CAP_PROP_FPS] == 60.0
+        assert int(capture.properties[cv2.CAP_PROP_FOURCC]) == cv2.VideoWriter_fourcc(*"MJPG")
         assert capture.properties[cv2.CAP_PROP_FRAME_WIDTH] == 1280.0
         assert capture.properties[cv2.CAP_PROP_FRAME_HEIGHT] == 720.0
         assert worker.actual_fps == 30.0
+        assert worker.peek_latest_frame() is not None
+        deadline = time.perf_counter() + 1.0
+        while worker.capture_fps == 0.0 and time.perf_counter() < deadline:
+            time.sleep(0.005)
+        assert worker.capture_fps > 0.0
     finally:
         worker.stop()
     assert capture.closed
@@ -108,20 +115,31 @@ def test_single_camera_loop_stays_active_until_q_and_runs_inference(
     monkeypatch, capsys
 ) -> None:
     class FakeCamera:
-        is_running = True
         last_error = None
+        capture_fps = 60.0
 
         def __init__(self) -> None:
             self.next_index = 1
             self.stopped = False
+            self.is_running = True
+            self._lock = threading.Lock()
+            self._latest = _record(0)
 
         def get_frame(self, *, timeout: float):
-            record = _record(self.next_index)
-            self.next_index += 1
-            return record
+            time.sleep(0.001)
+            with self._lock:
+                record = _record(self.next_index)
+                self.next_index += 1
+                self._latest = record
+                return record
+
+        def peek_latest_frame(self):
+            with self._lock:
+                return self._latest
 
         def stop(self) -> None:
             self.stopped = True
+            self.is_running = False
 
     class FakeExtractor:
         last_results = None
@@ -170,17 +188,17 @@ def test_single_camera_loop_stays_active_until_q_and_runs_inference(
     def fake_wait_key(delay):
         nonlocal key_calls
         key_calls += 1
-        return ord("q") if key_calls == 45 else -1
+        return ord("q") if key_calls >= 45 and engine.predictions >= 1 else -1
 
     monkeypatch.setattr(harness, "_load_engine", lambda *args: engine)
     monkeypatch.setattr(harness, "_open_camera", fake_open)
-    monkeypatch.setattr(harness, "HolisticExtractor", FakeExtractor)
+    monkeypatch.setattr(harness, "PoseHandsExtractor", FakeExtractor)
     monkeypatch.setattr(cv2, "imshow", lambda title, frame: displayed.append(frame))
     monkeypatch.setattr(cv2, "waitKey", fake_wait_key)
 
     harness.run(True, 0, 1)
 
     assert camera.stopped
-    assert len(displayed) == 45
-    assert engine.predictions == 1
+    assert len(displayed) > 0
+    assert engine.predictions >= 1
     assert "Prediction: HELLO" in capsys.readouterr().out

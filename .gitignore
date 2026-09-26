@@ -18,3 +18,13 @@ venv311/
 venv/
 __pycache__/
 *.pyc
+# Environments
+venv*/
+__pycache__/
+*.py[cod]
+
+# Data and Artifacts
+data/raw/
+artifacts/*.h5
+*.mp4
+*.tmp

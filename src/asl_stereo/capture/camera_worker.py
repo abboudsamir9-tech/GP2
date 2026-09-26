@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import queue
+import logging
 import sys
 import threading
 import time
+from collections import deque
 from collections.abc import Callable
 from types import TracebackType
 from typing import Any, Protocol, TypeVar
@@ -13,6 +15,8 @@ from typing import Any, Protocol, TypeVar
 import numpy as np
 
 from asl_stereo.contracts import TimestampedFrame
+
+LOGGER = logging.getLogger(__name__)
 
 
 class VideoCaptureLike(Protocol):
@@ -28,6 +32,17 @@ class VideoCaptureLike(Protocol):
 CaptureSource = int | str
 CaptureFactory = Callable[[CaptureSource], VideoCaptureLike]
 _CameraWorkerT = TypeVar("_CameraWorkerT", bound="CameraWorker")
+
+
+class CaptureThread(threading.Thread):
+    """Dedicated daemon producer; consumers never call ``VideoCapture.read``."""
+
+    def __init__(self, worker: "CameraWorker") -> None:
+        super().__init__(
+            target=worker._run,
+            name=f"camera-worker-{worker.camera_id}",
+            daemon=True,
+        )
 
 
 def _open_cv_capture(source: CaptureSource) -> VideoCaptureLike:
@@ -57,6 +72,12 @@ def _fps_property() -> int:
     import cv2
 
     return int(cv2.CAP_PROP_FPS)
+
+
+def _mjpg_property() -> tuple[int, int]:
+    import cv2
+
+    return int(cv2.CAP_PROP_FOURCC), int(cv2.VideoWriter_fourcc(*"MJPG"))
 
 
 class CameraWorker:
@@ -112,10 +133,13 @@ class CameraWorker:
         self._failure_backoff_s = failure_backoff_s
 
         self._frames: queue.Queue[TimestampedFrame] = queue.Queue(maxsize=1)
+        self._latest_frame: TimestampedFrame | None = None
+        self._latest_lock = threading.Lock()
+        self._capture_timestamps_ns: deque[int] = deque(maxlen=60)
         self._stop_event = threading.Event()
         self._ready_event = threading.Event()
         self._state_lock = threading.RLock()
-        self._thread: threading.Thread | None = None
+        self._thread: CaptureThread | None = None
         self._capture: VideoCaptureLike | None = None
         self._startup_error: BaseException | None = None
         self._startup_deadline = 0.0
@@ -135,11 +159,7 @@ class CameraWorker:
             self._ready_event.clear()
             self._startup_error = None
             self._startup_deadline = time.monotonic() + timeout
-            self._thread = threading.Thread(
-                target=self._run,
-                name=f"camera-worker-{self.camera_id}",
-                daemon=True,
-            )
+            self._thread = CaptureThread(self)
             self._thread.start()
 
         if not self._ready_event.wait(timeout):
@@ -162,6 +182,13 @@ class CameraWorker:
             # Backends may report this property as unsupported. The software
             # queue remains one slot, preserving bounded consumer latency.
             capture.set(_buffer_size_property(), 1.0)
+            if self.resolution is not None or self.target_fps is not None:
+                backend_name = getattr(capture, "getBackendName", lambda: "")()
+                if backend_name != "MSMF":
+                    fourcc_property, mjpg_fourcc = _mjpg_property()
+                    capture.set(fourcc_property, float(mjpg_fourcc))
+                else:
+                    LOGGER.info("MSMF backend selected; skipping unsupported MJPG negotiation")
             if self.resolution is not None:
                 width_property, height_property = _resolution_properties()
                 width, height = self.resolution
@@ -243,6 +270,9 @@ class CameraWorker:
             self._ready_event.set()
 
     def _publish_latest(self, frame: TimestampedFrame) -> None:
+        with self._latest_lock:
+            self._latest_frame = frame
+            self._capture_timestamps_ns.append(frame.timestamp_ns)
         try:
             self._frames.put_nowait(frame)
             return
@@ -268,6 +298,11 @@ class CameraWorker:
         except queue.Empty:
             return None
 
+    def peek_latest_frame(self) -> TimestampedFrame | None:
+        """Return the current RAM-only frame without draining the vision queue."""
+        with self._latest_lock:
+            return self._latest_frame
+
     def stop(self, *, timeout: float = 2.0) -> None:
         """Request shutdown, unblock a stuck backend if needed, and join."""
         if timeout < 0:
@@ -287,6 +322,9 @@ class CameraWorker:
             raise TimeoutError(f"camera {self.camera_id!r} did not stop cleanly")
         with self._state_lock:
             self._thread = None
+        with self._latest_lock:
+            self._latest_frame = None
+            self._capture_timestamps_ns.clear()
 
     def request_stop(self) -> None:
         """Signal shutdown without blocking the calling thread."""
@@ -315,6 +353,16 @@ class CameraWorker:
         return self._actual_fps
 
     @property
+    def capture_fps(self) -> float:
+        """Measured acquisition rate, distinct from the driver's FPS claim."""
+        with self._latest_lock:
+            timestamps = self._capture_timestamps_ns
+            if len(timestamps) < 2:
+                return 0.0
+            elapsed_ns = timestamps[-1] - timestamps[0]
+            return (len(timestamps) - 1) * 1e9 / elapsed_ns if elapsed_ns > 0 else 0.0
+
+    @property
     def last_error(self) -> BaseException | None:
         """Expose a background capture failure to the consumer loop."""
         return self._startup_error
@@ -332,4 +380,4 @@ class CameraWorker:
         self.stop()
 
 
-__all__ = ["CameraWorker", "CaptureFactory", "CaptureSource", "VideoCaptureLike"]
+__all__ = ["CameraWorker", "CaptureFactory", "CaptureSource", "CaptureThread", "VideoCaptureLike"]

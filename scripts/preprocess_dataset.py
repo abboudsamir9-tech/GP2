@@ -24,7 +24,7 @@ if str(SOURCE_ROOT) not in sys.path:
     sys.path.insert(0, str(SOURCE_ROOT))
 
 from asl_stereo.contracts import FEATURE_COUNT, JOINT_COUNT
-from asl_stereo.landmarks import HolisticExtractor
+from asl_stereo.landmarks import PoseHandsExtractor
 from asl_stereo.models.checkpoint import save_class_map
 from asl_stereo.preprocessing import PreprocessingPipeline
 
@@ -84,7 +84,7 @@ def extract_landmark_trajectory(video_path: str | Path) -> npt.NDArray[np.float3
     frames: list[npt.NDArray[np.float32]] = []
     frame_index = 0
     try:
-        with HolisticExtractor() as extractor:
+        with PoseHandsExtractor() as extractor:
             while True:
                 ok, frame = capture.read()
                 if not ok:

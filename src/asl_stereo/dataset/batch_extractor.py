@@ -13,7 +13,7 @@ import numpy as np
 import numpy.typing as npt
 
 from asl_stereo.contracts import FEATURE_COUNT, JOINT_COUNT
-from asl_stereo.landmarks import HolisticExtractor
+from asl_stereo.landmarks import PoseHandsExtractor
 from asl_stereo.preprocessing import PreprocessingPipeline
 
 
@@ -40,7 +40,7 @@ class BatchFeatureExtractor:
         *,
         window_size: int = 45,
         stride: int = 8,
-        holistic_factory: Any = HolisticExtractor,
+        holistic_factory: Any = PoseHandsExtractor,
         preprocessing_pipeline: PreprocessingPipeline | None = None,
     ) -> None:
         if window_size <= 0 or stride <= 0:
