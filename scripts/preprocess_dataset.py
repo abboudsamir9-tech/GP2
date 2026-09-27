@@ -26,7 +26,11 @@ if str(SOURCE_ROOT) not in sys.path:
 from asl_stereo.contracts import FEATURE_COUNT, JOINT_COUNT
 from asl_stereo.landmarks import PoseHandsExtractor
 from asl_stereo.models.checkpoint import save_class_map
-from asl_stereo.preprocessing import PreprocessingPipeline
+from asl_stereo.preprocessing import (
+    PreprocessingPipeline,
+    canonicalize_hand_presence,
+    interpolate_short_nan_gaps,
+)
 
 
 WINDOW_SIZE = 45
@@ -74,7 +78,7 @@ def discover_videos(videos_dir: str | Path) -> list[VideoRecord]:
 
 
 def extract_landmark_trajectory(video_path: str | Path) -> npt.NDArray[np.float32]:
-    """Decode a video into the strict ``(T, 46, 3)`` landmark contract."""
+    """Decode and trim idle edges into the strict (T, 46, 3) contract."""
     path = Path(video_path)
     capture = cv2.VideoCapture(str(path))
     if not capture.isOpened():
@@ -82,6 +86,7 @@ def extract_landmark_trajectory(video_path: str | Path) -> npt.NDArray[np.float3
         raise OSError(f"could not open video: {path}")
 
     frames: list[npt.NDArray[np.float32]] = []
+    active_frames: list[bool] = []
     frame_index = 0
     try:
         with PoseHandsExtractor() as extractor:
@@ -96,13 +101,43 @@ def extract_landmark_trajectory(video_path: str | Path) -> npt.NDArray[np.float3
                         f"extractor returned {coordinates.shape}; expected ({JOINT_COUNT}, 3)"
                     )
                 frames.append(coordinates.copy())
+                active_frames.append(
+                    bool(result.hand_present.any())
+                    and bool(np.isfinite(coordinates[POSE_JOINT_SLICE]).all())
+                )
                 frame_index += 1
     finally:
         capture.release()
 
     if not frames:
         raise ValueError(f"video contains no decodable frames: {path}")
-    return np.ascontiguousarray(np.stack(frames), dtype=np.float32)
+    if not any(active_frames):
+        raise ValueError(f"video has no active frames with a hand and upper-body anchors: {path}")
+    active_indices = np.flatnonzero(active_frames)
+    return np.ascontiguousarray(
+        np.stack(frames[active_indices[0] : active_indices[-1] + 1]),
+        dtype=np.float32,
+    )
+
+
+def _observed_hand_frames(
+    trajectory: npt.NDArray[np.float32], hand_slice: slice
+) -> npt.NDArray[np.bool_]:
+    hand = trajectory[:, hand_slice, :]
+    return np.isfinite(hand).all(axis=(1, 2)) & np.any(hand != 0.0, axis=(1, 2))
+
+
+def _trim_active_span(
+    trajectory: npt.NDArray[np.float32],
+) -> npt.NDArray[np.float32]:
+    active = (
+        _observed_hand_frames(trajectory, LEFT_HAND_JOINT_SLICE)
+        | _observed_hand_frames(trajectory, RIGHT_HAND_JOINT_SLICE)
+    ) & np.isfinite(trajectory[:, POSE_JOINT_SLICE]).all(axis=(1, 2))
+    if not active.any():
+        return np.empty((0, JOINT_COUNT, 3), dtype=np.float32)
+    indices = np.flatnonzero(active)
+    return np.ascontiguousarray(trajectory[indices[0] : indices[-1] + 1])
 
 
 def slice_feature_windows(
@@ -137,51 +172,48 @@ def prepare_feature_windows(
     *,
     pipeline: PreprocessingPipeline | None = None,
 ) -> tuple[npt.NDArray[np.float32], int]:
-    """Clean and validate windows under the absent-hand contract.
-
-    Undetected landmarks remain NaN throughout extraction and canonical
-    preprocessing.  Only after shoulder-centred normalization is a hand with
-    zero detections across the clip or complete window represented by 63
-    float32 zeros.  Any remaining NaN therefore belongs to an active hand or
-    upper-body pose and invalidates that window.
-    """
+    """Trim idle edges; interpolate short gaps; keep neutral hands exactly zero."""
     values = np.asarray(trajectory, dtype=np.float32)
     if values.ndim != 3 or values.shape[1:] != (JOINT_COUNT, 3):
         raise ValueError(f"trajectory must have shape (T, {JOINT_COUNT}, 3)")
     if values.shape[0] == 0:
         raise ValueError("trajectory must contain at least one frame")
 
-    processor = pipeline or PreprocessingPipeline()
-    cleaned = processor.process_sequence(values)
-    cleaned_windows = slice_feature_windows(cleaned)
-    raw_windows = slice_feature_windows(values.reshape(values.shape[0], FEATURE_COUNT))
-    raw_windows = raw_windows.reshape(-1, WINDOW_SIZE, JOINT_COUNT, 3)
-    if cleaned_windows.shape[0] != raw_windows.shape[0]:
-        raise RuntimeError("raw and preprocessed window counts differ")
+    values = _trim_active_span(values)
+    if len(values) == 0:
+        return np.empty((0, WINDOW_SIZE, FEATURE_COUNT), dtype=np.float32), 0
 
-    clip_absent = (
-        bool(np.isnan(values[:, LEFT_HAND_JOINT_SLICE, :]).all()),
-        bool(np.isnan(values[:, RIGHT_HAND_JOINT_SLICE, :]).all()),
+    processor = pipeline or PreprocessingPipeline()
+    canonical, neutral = canonicalize_hand_presence(values)
+    # Interpolate on the full active take first, so a short gap straddling a
+    # window edge does not become a false boundary gap in that window.
+    interpolated = interpolate_short_nan_gaps(
+        canonical, max_gap=processor.config.max_interpolation_gap
     )
-    hand_contracts = (
-        (LEFT_HAND_JOINT_SLICE, LEFT_HAND_FEATURE_SLICE),
-        (RIGHT_HAND_JOINT_SLICE, RIGHT_HAND_FEATURE_SLICE),
-    )
+    raw_windows = slice_feature_windows(
+        interpolated.reshape(interpolated.shape[0], FEATURE_COUNT)
+    ).reshape(-1, WINDOW_SIZE, JOINT_COUNT, 3)
+    if len(neutral) < WINDOW_SIZE:
+        neutral_windows = np.concatenate(
+            (neutral, np.repeat(neutral[-1:], WINDOW_SIZE - len(neutral), axis=0))
+        )[None, ...]
+    else:
+        neutral_windows = np.stack(
+            [neutral[start : start + WINDOW_SIZE]
+             for start in range(0, len(neutral) - WINDOW_SIZE + 1, STRIDE)]
+        )
+
     accepted: list[npt.NDArray[np.float32]] = []
     rejected = 0
-    for raw_window, cleaned_window in zip(raw_windows, cleaned_windows, strict=True):
-        candidate = cleaned_window.copy()
-        for hand_index, (joint_slice, feature_slice) in enumerate(hand_contracts):
-            window_absent = bool(np.isnan(raw_window[:, joint_slice, :]).all())
-            if clip_absent[hand_index] or window_absent:
-                # Apply only after normalization: zero is the mid-shoulder origin.
-                candidate[:, feature_slice] = np.float32(0.0)
+    for raw_window, neutral_window in zip(raw_windows, neutral_windows, strict=True):
+        candidate = processor.process_sequence(raw_window)
+        for hand_index, feature_slice in enumerate(
+            (LEFT_HAND_FEATURE_SLICE, RIGHT_HAND_FEATURE_SLICE)
+        ):
+            candidate[neutral_window[:, hand_index], feature_slice] = np.float32(0.0)
 
-        # Pose coordinates can never be structurally absent. An active hand or
-        # pose dropout of >=5 frames survives canonical interpolation as NaN.
-        if not np.isfinite(candidate[:, POSE_FEATURE_SLICE]).all() or not np.isfinite(
-            candidate
-        ).all():
+        # Unresolved >=5-frame active-hand or upper-body gaps remain NaN.
+        if not np.isfinite(candidate).all():
             rejected += 1
             continue
         accepted.append(np.ascontiguousarray(candidate, dtype=np.float32))
@@ -189,6 +221,47 @@ def prepare_feature_windows(
     if not accepted:
         return np.empty((0, WINDOW_SIZE, FEATURE_COUNT), dtype=np.float32), rejected
     return np.ascontiguousarray(np.stack(accepted), dtype=np.float32), rejected
+
+
+def recover_tracked_segment_windows(
+    trajectory: npt.ArrayLike,
+    *,
+    pipeline: PreprocessingPipeline | None = None,
+    minimum_frames: int = 8,
+) -> npt.NDArray[np.float32]:
+    """Recover a clean active subclip when every full window crosses a long gap.
+
+    This does not impute a >=5-frame loss or accept a window containing one.
+    Only the longest contiguous fully tracked segment is considered, and it
+    must contain enough real frames before repeat-padding to 45.
+    """
+    values = np.asarray(trajectory, dtype=np.float32)
+    if values.ndim != 3 or values.shape[1:] != (JOINT_COUNT, 3):
+        raise ValueError(f"trajectory must have shape (T, {JOINT_COUNT}, 3)")
+    if minimum_frames < 1:
+        raise ValueError("minimum_frames must be positive")
+    values = _trim_active_span(values)
+    if len(values) == 0:
+        return np.empty((0, WINDOW_SIZE, FEATURE_COUNT), dtype=np.float32)
+    processor = pipeline or PreprocessingPipeline()
+    canonical, _ = canonicalize_hand_presence(values)
+    interpolated = interpolate_short_nan_gaps(
+        canonical, max_gap=processor.config.max_interpolation_gap
+    )
+    finite = np.isfinite(interpolated).all(axis=(1, 2))
+    best_start = best_stop = 0
+    start = 0
+    for stop in range(len(finite) + 1):
+        if stop < len(finite) and finite[stop]:
+            continue
+        if stop - start > best_stop - best_start:
+            best_start, best_stop = start, stop
+        start = stop + 1
+    if best_stop - best_start < minimum_frames:
+        return np.empty((0, WINDOW_SIZE, FEATURE_COUNT), dtype=np.float32)
+    segment = interpolated[best_start:best_stop]
+    recovered, _ = prepare_feature_windows(segment, pipeline=processor)
+    return recovered
 
 
 def write_dataset(
@@ -265,6 +338,15 @@ def preprocess_dataset(
                     file=sys.stderr,
                 )
             if windows.shape[0] == 0:
+                windows = recover_tracked_segment_windows(
+                    trajectory, pipeline=pipeline
+                )
+                if windows.shape[0]:
+                    print(
+                        "  recovered longest fully tracked active segment",
+                        flush=True,
+                    )
+            if windows.shape[0] == 0:
                 skipped.append(record.path.name)
                 print("  warning: no finite windows produced", file=sys.stderr)
                 continue
@@ -312,6 +394,8 @@ def print_dataset_summary(
     print(f"features: {features.shape} {features.dtype}")
     print(f"labels:   {labels.shape} {labels.dtype}")
     print(f"skipped videos: {len(skipped)}")
+    for video_name in skipped:
+        print(f"  skipped: {video_name}")
 
 
 def build_parser() -> argparse.ArgumentParser:

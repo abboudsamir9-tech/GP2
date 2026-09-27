@@ -28,3 +28,13 @@ data/raw/
 artifacts/*.h5
 *.mp4
 *.tmp
+# Environments
+venv*/
+__pycache__/
+*.py[cod]
+
+# Data and Artifacts
+data/raw/
+artifacts/*.h5
+*.mp4
+*.tmp

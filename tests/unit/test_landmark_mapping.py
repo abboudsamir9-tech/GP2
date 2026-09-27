@@ -1,8 +1,11 @@
+import sys
+from types import ModuleType, SimpleNamespace
+
 import numpy as np
-from types import SimpleNamespace
 
 from asl_stereo.contracts import LandmarkFrame
 from asl_stereo.landmarks import PoseHandsExtractor
+from asl_stereo.landmarks.holistic_extractor import _load_solution_modules
 from asl_stereo.landmarks.landmark_mapping import (
     HAND_LANDMARK_COUNT,
     LANDMARK_NAMES,
@@ -56,7 +59,7 @@ def _point(value: float):
     return SimpleNamespace(x=value, y=value + 0.1, z=value + 0.2)
 
 
-def test_extractor_outputs_exact_shape_masks_and_nan_for_absent_hand() -> None:
+def test_extractor_zero_pads_never_seen_hand() -> None:
     pose = SimpleNamespace(landmark=[_point(index / 100.0) for index in range(33)])
     right_hand = SimpleNamespace(landmark=[_point(index / 20.0) for index in range(21)])
     pose_result = SimpleNamespace(pose_landmarks=pose, face_landmarks=object())
@@ -83,10 +86,9 @@ def test_extractor_outputs_exact_shape_masks_and_nan_for_absent_hand() -> None:
 
     assert output.coordinates.shape == (46, 3)
     assert output.coordinates.dtype == np.float32
-    assert np.isnan(output.coordinates[LEFT_HAND_SLICE]).all()
-    assert not np.equal(output.coordinates[LEFT_HAND_SLICE], 0.0).any()
+    np.testing.assert_array_equal(output.coordinates[LEFT_HAND_SLICE], 0.0)
     np.testing.assert_array_equal(output.hand_present, np.array([0.0, 1.0], np.float32))
-    np.testing.assert_array_equal(output.joint_mask[:21], np.zeros(21, np.float32))
+    np.testing.assert_array_equal(output.joint_mask[:21], np.ones(21, np.float32))
     np.testing.assert_array_equal(output.joint_mask[21:], np.ones(25, np.float32))
     assert pose_options["enable_segmentation"] is False
     assert pose_options["model_complexity"] == 0
@@ -149,3 +151,65 @@ def test_handedness_stays_stable_during_crossing() -> None:
     np.testing.assert_array_equal(output.hand_presence, (1.0, 1.0))
     extractor.close()
     assert extractor.pose_tracker.closed and extractor.hand_tracker.closed
+
+
+def test_tracked_hand_loss_is_nan_until_tracking_reset() -> None:
+    pose_result = SimpleNamespace(pose_landmarks=None)
+    hand = SimpleNamespace(landmark=[_point(0.3) for _ in range(21)])
+    hand_tracker = _FakeTracker(
+        SimpleNamespace(
+            multi_hand_landmarks=[hand],
+            multi_handedness=[
+                SimpleNamespace(classification=[SimpleNamespace(label="Left", score=0.9)])
+            ],
+        ),
+        {},
+    )
+    with PoseHandsExtractor(
+        pose_factory=lambda **_: _FakeTracker(pose_result, {}),
+        hands_factory=lambda **_: hand_tracker,
+    ) as extractor:
+        observed = extractor.process(np.zeros((8, 8, 3), np.uint8))
+        np.testing.assert_array_equal(observed.hand_presence, (0.0, 1.0))
+        np.testing.assert_array_equal(observed.coordinates[:21], 0.0)
+
+        hand_tracker.result = SimpleNamespace(
+            multi_hand_landmarks=None, multi_handedness=None
+        )
+        missed = extractor.process(np.zeros((8, 8, 3), np.uint8))
+        assert np.isnan(missed.coordinates[21:42]).all()
+        np.testing.assert_array_equal(missed.coordinates[:21], 0.0)
+
+        extractor.reset_tracking()
+        reset = extractor.process(np.zeros((8, 8, 3), np.uint8))
+        np.testing.assert_array_equal(reset.coordinates[:42], 0.0)
+
+
+def test_explicit_solutions_import_uses_internal_fallback(monkeypatch) -> None:
+    import mediapipe  # Fully initialize its real package before mocking imports.
+
+    python_package = ModuleType("mediapipe.python")
+    python_package.__path__ = []
+    solutions_package = ModuleType("mediapipe.python.solutions")
+    solutions_package.__path__ = []
+    pose_module = ModuleType("mediapipe.python.solutions.pose")
+    hands_module = ModuleType("mediapipe.python.solutions.hands")
+    pose_module.Pose = lambda **options: _FakeTracker(
+        SimpleNamespace(pose_landmarks=None), options
+    )
+    hands_module.Hands = lambda **options: _FakeTracker(
+        SimpleNamespace(multi_hand_landmarks=None), options
+    )
+    solutions_package.pose = pose_module
+    solutions_package.hands = hands_module
+    monkeypatch.setitem(sys.modules, "mediapipe.python", python_package)
+    monkeypatch.setitem(sys.modules, "mediapipe.python.solutions", solutions_package)
+    monkeypatch.setitem(sys.modules, "mediapipe.python.solutions.pose", pose_module)
+    monkeypatch.setitem(sys.modules, "mediapipe.python.solutions.hands", hands_module)
+
+    assert _load_solution_modules() == (pose_module, hands_module)
+    with PoseHandsExtractor(model_complexity=1) as extractor:
+        frame = extractor.process(np.zeros((8, 8, 3), np.uint8))
+        assert frame.coordinates.shape == (46, 3)
+        np.testing.assert_array_equal(frame.coordinates[:42], 0.0)
+        assert np.isnan(frame.coordinates[42:]).all()

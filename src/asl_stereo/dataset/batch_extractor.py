@@ -63,6 +63,9 @@ class BatchFeatureExtractor:
 
         raw_frames: list[npt.NDArray[np.float32]] = []
         extractor = self._get_extractor()
+        reset_tracking = getattr(extractor, "reset_tracking", None)
+        if callable(reset_tracking):
+            reset_tracking()
         frame_index = 0
         try:
             while True:

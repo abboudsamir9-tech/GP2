@@ -160,6 +160,17 @@ class SlidingWindowBuffer(TemporalBuffer):
         if len(self._raw_landmarks) < self.window_size:
             return None
 
+        # Structural zero padding is finite, but it is not an observed sign.
+        # Keep the raw frame for later interpolation without advancing the
+        # valid-frame inference cadence on idle or dropped frames.
+        hand_observed = any(
+            np.isfinite(values[hand_slice]).all()
+            and np.any(values[hand_slice] != 0.0)
+            for hand_slice in (slice(0, 21), slice(21, 42))
+        )
+        if not hand_observed or not np.isfinite(values[42:46]).all():
+            return None
+
         raw_window = np.stack(tuple(self._raw_landmarks), axis=0)
         cleaned = preprocessor.process_live_window(raw_window)
         if cleaned.shape != (self.window_size, FEATURE_COUNT):

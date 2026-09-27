@@ -138,3 +138,26 @@ def test_live_landmark_window_uses_offline_temporal_cleaning() -> None:
     assert emitted is not None
     assert emitted.shape == (1, 45, 138)
     assert torch.isfinite(emitted).all()
+
+
+def test_zero_padded_idle_frame_does_not_advance_live_cadence() -> None:
+    buffer = SlidingWindowBuffer(window_size=45, stride=8)
+    pipeline = PreprocessingPipeline()
+    frame = make_landmark_frame()
+    frame[21:42] = 0.0
+    idle = frame.copy()
+    idle[:42] = 0.0
+
+    for timestamp in range(1, 45):
+        assert buffer.append_landmarks(
+            frame, timestamp_ns=timestamp, preprocessor=pipeline
+        ) is None
+    assert buffer.append_landmarks(
+        idle, timestamp_ns=45, preprocessor=pipeline
+    ) is None
+    emitted = buffer.append_landmarks(
+        frame, timestamp_ns=46, preprocessor=pipeline
+    )
+    assert emitted is not None
+    assert tuple(emitted.shape) == (1, 45, 138)
+    assert bool(torch.isfinite(emitted).all())

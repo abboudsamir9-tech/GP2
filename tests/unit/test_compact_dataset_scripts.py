@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import h5py
 import numpy as np
 
 from scripts.preprocess_dataset import (
+    extract_landmark_trajectory,
     parse_video_filename,
     prepare_feature_windows,
+    recover_tracked_segment_windows,
     slice_feature_windows,
     write_dataset,
 )
+import scripts.preprocess_dataset as preprocess_module
 from scripts.train_classifier import (
     SequenceDataset,
     load_feature_artifact,
@@ -58,6 +62,8 @@ def _valid_landmark_sequence(frame_count=45):
 def test_structurally_absent_hand_is_zero_after_normalization():
     trajectory = _valid_landmark_sequence()
     trajectory[:, :21] = np.nan
+    trajectory[:, 42] = (0.2, 0.0, 0.0)
+    trajectory[:, 43] = (0.8, 0.0, 0.0)
 
     windows, rejected = prepare_feature_windows(trajectory)
 
@@ -66,6 +72,147 @@ def test_structurally_absent_hand_is_zero_after_normalization():
     assert windows.dtype == np.float32
     np.testing.assert_array_equal(windows[:, :, :63], 0.0)
     assert np.isfinite(windows).all()
+
+
+def test_zero_padded_nondominant_hand_stays_zero_after_normalization():
+    trajectory = _valid_landmark_sequence()
+    trajectory[:, 21:42] = 0.0
+    trajectory[:, 42] = (0.2, 0.0, 0.0)
+    trajectory[:, 43] = (0.8, 0.0, 0.0)
+
+    windows, rejected = prepare_feature_windows(trajectory)
+
+    assert rejected == 0
+    assert windows.shape == (1, 45, 138)
+    np.testing.assert_array_equal(windows[:, :, 63:126], 0.0)
+
+
+def test_idle_clip_edges_are_trimmed_before_windowing():
+    trajectory = _valid_landmark_sequence(70)
+    trajectory[:10, :42] = 0.0
+    trajectory[60:, :42] = 0.0
+
+    windows, rejected = prepare_feature_windows(trajectory)
+
+    assert rejected == 0
+    assert windows.shape == (1, 45, 138)
+
+
+def test_short_active_clip_is_repeat_padded():
+    trajectory = _valid_landmark_sequence(20)
+    trajectory[:, 21:42] = 0.0
+
+    windows, rejected = prepare_feature_windows(trajectory)
+
+    assert rejected == 0
+    assert windows.shape == (1, 45, 138)
+    np.testing.assert_array_equal(windows[0, -1], windows[0, 19])
+
+
+def test_zero_encoded_active_hand_dropout_is_interpolated_or_rejected():
+    short = _valid_landmark_sequence()
+    short[:, 21:42] = 0.0
+    short[10:14, :21] = 0.0
+    accepted, short_rejected = prepare_feature_windows(short)
+    assert short_rejected == 0
+    assert accepted.shape == (1, 45, 138)
+    assert np.isfinite(accepted).all()
+
+    long = _valid_landmark_sequence()
+    long[:, 21:42] = 0.0
+    long[10:15, :21] = 0.0
+    rejected_windows, long_rejected = prepare_feature_windows(long)
+    assert long_rejected == 1
+    assert rejected_windows.shape == (0, 45, 138)
+
+
+def test_long_gap_rejects_full_windows_but_recovers_clean_subclip():
+    trajectory = _valid_landmark_sequence(63)
+    trajectory[:, 21:42] = 0.0
+    trajectory[36:54, :21] = np.nan
+
+    full_windows, rejected = prepare_feature_windows(trajectory)
+    recovered = recover_tracked_segment_windows(trajectory)
+
+    assert full_windows.shape == (0, 45, 138)
+    assert rejected == 3
+    assert recovered.shape == (1, 45, 138)
+    assert np.isfinite(recovered).all()
+    np.testing.assert_array_equal(recovered[:, :, 63:126], 0.0)
+
+
+def test_sparse_false_second_hand_detections_do_not_poison_one_handed_clip():
+    trajectory = _valid_landmark_sequence()
+    trajectory[:, 21:42] = np.nan
+    for index in (4, 12, 24, 39):
+        trajectory[index, 21:42] = (0.7, 0.3, 0.1)
+
+    windows, rejected = prepare_feature_windows(trajectory)
+
+    assert rejected == 0
+    assert windows.shape == (1, 45, 138)
+    np.testing.assert_array_equal(windows[:, :, 63:126], 0.0)
+
+    shorter = _valid_landmark_sequence(31)
+    shorter[:, 21:42] = np.nan
+    for index in (2, 7, 15, 23, 29):
+        shorter[index, 21:42] = (0.7, 0.3, 0.1)
+    short_windows, short_rejected = prepare_feature_windows(shorter)
+    assert short_rejected == 0
+    assert short_windows.shape == (1, 45, 138)
+    np.testing.assert_array_equal(short_windows[:, :, 63:126], 0.0)
+
+    brief_flip = _valid_landmark_sequence(12)
+    brief_flip[:, :21] = np.nan
+    brief_flip[:3, :21] = (0.1, 0.2, 0.3)
+    brief_flip[4, :21] = (0.1, 0.2, 0.3)
+    brief_flip[5:11, 21:42] = (0.4, 0.5, 0.6)
+    flip_windows, flip_rejected = prepare_feature_windows(brief_flip)
+    assert flip_rejected == 0
+    assert flip_windows.shape == (1, 45, 138)
+    np.testing.assert_array_equal(flip_windows[:, :, :63], 0.0)
+
+
+def test_video_extraction_trims_idle_leading_and_trailing_frames(monkeypatch):
+    trajectory = _valid_landmark_sequence(7)
+    trajectory[:2, :42] = 0.0
+    trajectory[5:, :42] = 0.0
+    state = {"index": 0, "released": False}
+
+    class FakeCapture:
+        def isOpened(self):
+            return True
+
+        def read(self):
+            if state["index"] == len(trajectory):
+                return False, None
+            state["index"] += 1
+            return True, np.zeros((8, 8, 3), dtype=np.uint8)
+
+        def release(self):
+            state["released"] = True
+
+    class FakeExtractor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            pass
+
+        def process(self, _frame, *, frame_index):
+            coordinates = trajectory[frame_index]
+            hand_present = np.array(
+                [float(np.any(coordinates[:21] != 0)), 0.0], dtype=np.float32
+            )
+            return SimpleNamespace(coordinates=coordinates, hand_present=hand_present)
+
+    monkeypatch.setattr(preprocess_module.cv2, "VideoCapture", lambda _: FakeCapture())
+    monkeypatch.setattr(preprocess_module, "PoseHandsExtractor", FakeExtractor)
+
+    result = extract_landmark_trajectory("mock.mp4")
+
+    assert result.shape == (3, 46, 3)
+    assert state["released"]
 
 
 def test_active_hand_interior_gap_shorter_than_five_is_interpolated():

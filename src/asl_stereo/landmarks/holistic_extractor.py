@@ -23,6 +23,23 @@ from .landmark_mapping import HAND_LANDMARK_COUNT, LEFT_HAND_OFFSET, POSE_SOURCE
 LOGGER = logging.getLogger(__name__)
 
 
+def _load_solution_modules() -> tuple[Any, Any]:
+    """Import legacy Solutions modules without relying on the mp.solutions attribute."""
+    try:
+        import mediapipe.solutions.pose as mp_pose
+        import mediapipe.solutions.hands as mp_hands
+    except (AttributeError, ImportError):
+        try:
+            from mediapipe.python.solutions import pose as mp_pose
+            from mediapipe.python.solutions import hands as mp_hands
+        except ImportError as error:
+            raise ImportError(
+                "MediaPipe Pose/Hands Solutions API is unavailable. "
+                "Install the project's pinned mediapipe==0.10.14."
+            ) from error
+    return mp_pose, mp_hands
+
+
 @dataclass(frozen=True, slots=True)
 class OverlayPoint:
     x: float
@@ -65,14 +82,15 @@ class PoseHandsExtractor:
         self.input_is_mirrored = bool(input_is_mirrored)
         if pose_factory is None or hands_factory is None:
             import mediapipe as mp
+            mp_pose, mp_hands = _load_solution_modules()
             if pose_factory is None:
                 lite_model = Path(mp.__file__).resolve().parent / "modules" / "pose_landmark" / "pose_landmark_lite.tflite"
                 if model_complexity == 0 and not lite_model.is_file():
                     LOGGER.warning("MediaPipe Lite pose model missing at %s; using bundled full pose model", lite_model)
                     model_complexity = 1
-                pose_factory = mp.solutions.pose.Pose
+                pose_factory = mp_pose.Pose
             if hands_factory is None:
-                hands_factory = mp.solutions.hands.Hands
+                hands_factory = mp_hands.Hands
         self.model_complexity = model_complexity
         self.pose_tracker = pose_factory(
             static_image_mode=False,
@@ -97,6 +115,7 @@ class PoseHandsExtractor:
         # slower tracker, without sharing tracker state across camera views.
         self._tracker_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="asl-track")
         self._last_results: RestrictedPoseHandsResults | None = None
+        self._hand_seen = np.zeros(2, dtype=bool)
         self._closed = False
 
     @property
@@ -144,10 +163,26 @@ class PoseHandsExtractor:
         upper_body = self._extract_upper_body(getattr(pose_results, "pose_landmarks", None), coordinates)
         assigned = self._assign_hands(hands_results, coordinates)
         left, right = assigned.get("Left"), assigned.get("Right")
-        if left is not None:
-            hand_present[0] = 1.0
-        if right is not None:
-            hand_present[1] = 1.0
+        for hand_index, (points, hand_slice) in enumerate(
+            ((left, slice(0, 21)), (right, slice(21, 42)))
+        ):
+            detected = points is not None and bool(
+                np.isfinite(coordinates[hand_slice]).all()
+            )
+            if detected:
+                hand_present[hand_index] = 1.0
+                self._hand_seen[hand_index] = True
+            else:
+                # A hand never observed in this take is structural absence.
+                # Once seen, an undetected hand remains NaN so short tracking
+                # gaps can be interpolated and long gaps can be rejected.
+                coordinates[hand_slice] = (
+                    np.nan if self._hand_seen[hand_index] else np.float32(0.0)
+                )
+                if hand_index == 0:
+                    left = None
+                else:
+                    right = None
         self._last_results = RestrictedPoseHandsResults(left, right, upper_body)
         assert coordinates.shape == (JOINT_COUNT, 3)
         joint_mask = np.isfinite(coordinates).all(axis=1).astype(np.float32)
@@ -158,6 +193,13 @@ class PoseHandsExtractor:
             timestamp_ns=timestamp_ns,
             frame_index=frame_index,
         )
+
+    def reset_tracking(self) -> None:
+        """Start a new independent clip without carrying hand state across it."""
+        if self._closed:
+            raise RuntimeError("extractor is closed")
+        self._hand_seen[:] = False
+        self._last_results = None
 
     def _assign_hands(
         self, results: Any, output: npt.NDArray[np.float32]
