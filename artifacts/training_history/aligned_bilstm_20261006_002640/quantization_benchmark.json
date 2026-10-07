@@ -1,0 +1,40 @@
+{
+  "input_contract": {
+    "shape": [
+      1,
+      45,
+      138
+    ],
+    "dtype": "float32",
+    "device": "cpu"
+  },
+  "benchmark": {
+    "warmup": 50,
+    "iterations": 200,
+    "cpu_num_threads": 1
+  },
+  "checkpoint_contract": {
+    "num_classes": 5,
+    "window_size": 45,
+    "feature_dim": 138,
+    "internal_feature_dim": 286,
+    "model_type": "bilstm_attention"
+  },
+  "baseline_fp32": {
+    "file_size_mb": 9.685257911682129,
+    "mean_ms": 36.22273999996651,
+    "median_ms": 28.21265000056883,
+    "p95_ms": 64.61922500038774,
+    "peak_ram_mb": 0.007465362548828125
+  },
+  "optimized_int8_torchscript": {
+    "file_size_mb": 2.48734188079834,
+    "mean_ms": 60.29529500002354,
+    "median_ms": 43.278449999888835,
+    "p95_ms": 155.60230500013859,
+    "peak_ram_mb": 0.00415802001953125
+  },
+  "latency_gate_ms": 80.0,
+  "latency_gate_passed": false,
+  "torch_version": "2.4.1+cpu"
+}

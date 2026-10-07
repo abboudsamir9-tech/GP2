@@ -12,10 +12,11 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, pyqtSlot
+from PyQt5.QtCore import Qt, QThread, QTimer, pyqtSignal, pyqtSlot
 from PyQt5.QtGui import QCloseEvent
 from PyQt5.QtWidgets import (
     QDialog,
+    QCheckBox,
     QDialogButtonBox,
     QFormLayout,
     QFrame,
@@ -48,18 +49,20 @@ LOGGER = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 CAMERA_INDICES = (0, 1, 2)
 CAMERA_RESOLUTION = (1280, 720)
-CAMERA_FPS = 60.0
+CAMERA_FPS = 30.0
 CAMERA_TIMEOUT_S = 5.0
 GUI_MIN_CONFIDENCE = 0.35
 INFERENCE_STRIDE = 6
 DISPLAY_INTERVAL_S = 1.0 / 60.0
+SHUTDOWN_TIMEOUT_S = 6.0
 
 
 @dataclass(slots=True)
 class RuntimeSettings:
-    front_camera_index: int = 1
-    side_camera_index: int = 0
+    front_camera_index: int = 0
+    side_camera_index: int = 1
     confidence_threshold: float = 0.40
+    stereo_enabled: bool = False
 
 
 class PipelineWorker(QThread):
@@ -90,6 +93,9 @@ class PipelineWorker(QThread):
         self._resource_lock = threading.RLock()
         self._front_camera: CameraWorker | None = None
         self._side_camera: CameraWorker | None = None
+        # Retain handles even while start() is negotiating a device, or after
+        # a failed stop, until cleanup actually succeeds.
+        self._owned_cameras: list[CameraWorker] = []
         self._threshold_lock = threading.Lock()
         self._confidence_threshold = max(settings.confidence_threshold, GUI_MIN_CONFIDENCE)
         self._buffer_full_logged = False
@@ -138,10 +144,11 @@ class PipelineWorker(QThread):
         self._stop_event.set()
         self.requestInterruption()
         with self._resource_lock:
-            cameras = (self._front_camera, self._side_camera)
+            cameras = tuple(self._owned_cameras)
         for camera in cameras:
-            if camera is not None:
-                camera.request_stop()
+            request_stop = getattr(camera, "request_stop", None)
+            if callable(request_stop):
+                request_stop()
 
     def _open_camera(
         self, index: int, camera_id: str
@@ -152,8 +159,15 @@ class PipelineWorker(QThread):
             resolution=CAMERA_RESOLUTION,
             target_fps=CAMERA_FPS,
         )
+        with self._resource_lock:
+            self._owned_cameras.append(camera)
         try:
+            if self._stop_event.is_set():
+                raise RuntimeError("camera startup cancelled")
             camera.start(timeout=CAMERA_TIMEOUT_S)
+            if self._stop_event.is_set():
+                camera.request_stop()
+                raise RuntimeError("camera startup cancelled")
             first_frame = camera.get_frame(timeout=1.5)
             if (
                 first_frame is None
@@ -244,7 +258,10 @@ class PipelineWorker(QThread):
                 self._front_camera = front_camera
 
             first_side = None
-            if self.settings.side_camera_index != selected_front:
+            if not self.calibration.available:
+                LOGGER.warning("Stereo calibration unavailable; entering single-camera fallback")
+            if (self.settings.stereo_enabled and self.calibration.available
+                    and self.settings.side_camera_index != selected_front):
                 try:
                     side_camera, first_side = self._open_camera(
                         self.settings.side_camera_index, "side"
@@ -265,6 +282,9 @@ class PipelineWorker(QThread):
                 with self._resource_lock:
                     self._side_camera = None
 
+            if self._stop_event.is_set():
+                return
+
             vision_thread = threading.Thread(
                 target=self._vision_loop,
                 args=(front_camera, side_camera, first_front, first_side),
@@ -279,18 +299,56 @@ class PipelineWorker(QThread):
                 print(f"[GUI ERROR] {type(error).__name__}: {error}", flush=True)
                 self.error_occurred.emit(f"{type(error).__name__}: {error}")
         finally:
-            self._stop_event.set()
+            self._shutdown_resources(vision_thread)
+
+    def _shutdown_resources(self, vision_thread: threading.Thread | None) -> None:
+        """Join children off the UI thread; never report finished over live children."""
+        self.stop()
+        with self._resource_lock:
+            pending_cameras = list(self._owned_cameras)
+        deadline = time.monotonic() + SHUTDOWN_TIMEOUT_S
+
+        def stop_camera(camera, timeout: float) -> bool:
+            try:
+                if isinstance(camera, CameraWorker):
+                    camera.stop(timeout=timeout)
+                else:
+                    camera.stop()  # Compatible injected camera adapters.
+                return True
+            except Exception as error:
+                LOGGER.debug("Camera shutdown pending: %s", error, exc_info=True)
+                return False
+
+        pending_cameras = [camera for camera in pending_cameras if not stop_camera(
+            camera, max(0.0, deadline - time.monotonic()),
+        )]
+        if vision_thread is not None:
+            vision_thread.join(max(0.0, deadline - time.monotonic()))
+        vision_alive = vision_thread is not None and vision_thread.is_alive()
+        if pending_cameras or vision_alive:
+            message = "Shutdown delayed by a native worker; waiting for resource cleanup"
+            LOGGER.warning(message)
+            self.error_occurred.emit(message)
+        # Native calls cannot safely be killed in-process. Retain the parent
+        # worker and responsive window until actual cleanup, with bounded joins.
+        while pending_cameras or vision_alive:
+            pending_cameras = [camera for camera in pending_cameras
+                               if not stop_camera(camera, 0.05)]
             if vision_thread is not None:
-                vision_thread.join(timeout=5.0)
-            for camera in (front_camera, side_camera):
-                if camera is not None:
-                    try:
-                        camera.stop()
-                    except Exception as error:
-                        self.error_occurred.emit(f"Camera shutdown: {error}")
-            with self._resource_lock:
-                self._front_camera = None
-                self._side_camera = None
+                vision_thread.join(0.05)
+                vision_alive = vision_thread.is_alive()
+            if pending_cameras or vision_alive:
+                time.sleep(0.05)
+        with self._resource_lock:
+            self._front_camera = None
+            self._side_camera = None
+            self._owned_cameras.clear()
+        with self._frame_mailbox_lock:
+            self._latest_frames = None
+            self._frame_signal_pending = False
+        with self._overlay_lock:
+            self._front_overlay_results = None
+            self._side_overlay_results = None
 
     def _vision_loop(
         self,
@@ -308,7 +366,10 @@ class PipelineWorker(QThread):
             watchdog = SyncWatchdog(purge_callback=synchronizer.purge)
             matcher = StereoMatcher(self.calibration, fallback_scope="frame")
             preprocessor = PreprocessingPipeline()
-            window_buffer = SlidingWindowBuffer(stride=INFERENCE_STRIDE)
+            window_buffer = SlidingWindowBuffer(
+                stride=INFERENCE_STRIDE,
+                align_features=bool(getattr(self.inference_engine, "feature_alignment_enabled", False)),
+            )
             frame_count = 0
             fps_started = time.perf_counter()
             last_front_time = time.monotonic()
@@ -643,6 +704,7 @@ class SettingsDialog(QDialog):
         self.setWindowTitle("Runtime Settings")
         self.configuration = configuration
         self._original_values = {
+            "stereo_enabled": bool(_config_get(configuration, "stereo_enabled")),
             "front_camera_index": int(_config_get(configuration, "front_camera_index")),
             "side_camera_index": int(_config_get(configuration, "side_camera_index")),
             "confidence_threshold": float(
@@ -656,6 +718,8 @@ class SettingsDialog(QDialog):
         self.side_camera_spin = QSpinBox(self)
         self.side_camera_spin.setRange(0, 32)
         self.side_camera_spin.setValue(int(_config_get(configuration, "side_camera_index")))
+        self.stereo_checkbox = QCheckBox("Enable calibrated dual-camera mode", self)
+        self.stereo_checkbox.setChecked(bool(_config_get(configuration, "stereo_enabled")))
         self.confidence_slider = QSlider(Qt.Horizontal, self)
         self.confidence_slider.setRange(35, 100)
         self.confidence_slider.setValue(
@@ -666,6 +730,7 @@ class SettingsDialog(QDialog):
         form = QFormLayout(self)
         form.addRow("Front camera", self.front_camera_spin)
         form.addRow("45° side camera", self.side_camera_spin)
+        form.addRow("Stereo fusion", self.stereo_checkbox)
         threshold_row = QHBoxLayout()
         threshold_row.addWidget(self.confidence_slider)
         threshold_row.addWidget(self.confidence_value)
@@ -678,6 +743,7 @@ class SettingsDialog(QDialog):
         self.front_camera_spin.valueChanged.connect(self._update_configuration)
         self.side_camera_spin.valueChanged.connect(self._update_configuration)
         self.confidence_slider.valueChanged.connect(self._update_configuration)
+        self.stereo_checkbox.toggled.connect(self._update_configuration)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         self._update_configuration()
@@ -689,6 +755,7 @@ class SettingsDialog(QDialog):
         _config_set(self.configuration, "front_camera_index", self.front_camera_spin.value())
         _config_set(self.configuration, "side_camera_index", self.side_camera_spin.value())
         _config_set(self.configuration, "confidence_threshold", threshold)
+        _config_set(self.configuration, "stereo_enabled", self.stereo_checkbox.isChecked())
 
     def reject(self) -> None:
         for key, value in self._original_values.items():
@@ -711,6 +778,14 @@ class MainWindow(QMainWindow):
         self._display_times: deque[float] = deque(maxlen=60)
         self._display_fps = 0.0
         self._last_display_log_at = 0.0
+        self._stopping = False
+        self._close_requested = False
+        self._restart_after_stop = False
+        self._shutdown_deadline = 0.0
+        self._shutdown_timeout_reported = False
+        self._shutdown_timer = QTimer(self)
+        self._shutdown_timer.setInterval(50)
+        self._shutdown_timer.timeout.connect(self._poll_shutdown)
         self.setWindowTitle("Live ASL Stereo Translator")
         self.resize(1500, 850)
         self._build_ui()
@@ -810,6 +885,8 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot()
     def start_pipeline(self) -> None:
+        if self._stopping or self._close_requested:
+            return
         if self.worker is not None and self.worker.isRunning():
             return
         self.worker = self._worker_factory(replace(self.settings))
@@ -827,10 +904,26 @@ class MainWindow(QMainWindow):
         worker = self.worker
         if worker is None:
             return
+        if not self._stopping:
+            self._shutdown_deadline = time.monotonic() + SHUTDOWN_TIMEOUT_S
+            self._shutdown_timeout_reported = False
+        self._stopping = True
+        self.start_button.setEnabled(False)
+        self.stop_button.setEnabled(False)
         worker.stop()
-        if not worker.wait(6_000):
-            self._show_error("Pipeline did not stop within six seconds")
-        self._worker_finished()
+        self._shutdown_timer.start()
+        self._poll_shutdown()
+
+    @pyqtSlot()
+    def _poll_shutdown(self) -> None:
+        worker = self.worker
+        if worker is None or (not worker.isRunning() and worker.wait(0)):
+            self._worker_finished()
+        elif time.monotonic() >= self._shutdown_deadline and not self._shutdown_timeout_reported:
+            self._shutdown_timeout_reported = True
+            message = "Shutdown delayed; waiting for camera/tracker cleanup"
+            LOGGER.warning(message)
+            self.prediction_detail.setText(message)
 
     @pyqtSlot()
     def open_settings(self) -> None:
@@ -845,8 +938,8 @@ class MainWindow(QMainWindow):
                 or old_side != self.settings.side_camera_index
             )
             if cameras_changed:
+                self._restart_after_stop = True
                 self.stop_pipeline()
-                self.start_pipeline()
             else:
                 self.worker.update_confidence_threshold(
                     self.settings.confidence_threshold
@@ -854,6 +947,8 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot(np.ndarray, np.ndarray)
     def _update_frames(self, front: np.ndarray, side: np.ndarray) -> None:
+        if self.sender() is not None and self.sender() is not self.worker:
+            return
         if self.worker is not None:
             latest = self.worker.consume_latest_frames()
             if latest is not None:
@@ -872,6 +967,8 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot(str, float, float)
     def _handle_prediction(self, gloss: str, confidence: float, latency_ms: float) -> None:
+        if self.sender() is not None and self.sender() is not self.worker:
+            return
         print(
             f"[GUI DEBUG] Received gloss signal: '{gloss}' "
             f"(conf: {confidence:.2f})",
@@ -891,6 +988,8 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot(dict)
     def _update_telemetry(self, telemetry: dict[str, Any]) -> None:
+        if self.sender() is not None and self.sender() is not self.worker:
+            return
         confidence = float(telemetry.get("confidence", self._last_confidence))
         display = map_telemetry(telemetry, confidence=confidence)
         _set_badge(self.sync_badge, "Camera Sync", display.sync_text, display.sync_ok)
@@ -911,15 +1010,47 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot(str)
     def _show_error(self, message: str) -> None:
+        if self.sender() is not None and self.sender() is not self.worker:
+            return
+        if self._stopping or self._close_requested:
+            LOGGER.error("Shutdown: %s", message)
+            self.prediction_detail.setText(message)
+            return
         QMessageBox.critical(self, "Pipeline Error", message)
 
     @pyqtSlot()
     def _worker_finished(self) -> None:
-        self.start_button.setEnabled(True)
+        sender = self.sender()
+        # Timer callbacks are also allowed; stale workers are not.
+        if sender is not None and sender not in (self.worker, self._shutdown_timer):
+            return
+        if self.worker is not None and (self.worker.isRunning() or not self.worker.wait(0)):
+            if not self._stopping:
+                self._stopping = True
+                self._shutdown_deadline = time.monotonic() + SHUTDOWN_TIMEOUT_S
+                self._shutdown_timeout_reported = False
+                self.start_button.setEnabled(False)
+                self.stop_button.setEnabled(False)
+            self._shutdown_timer.start()
+            return
+        self._shutdown_timer.stop()
+        self._stopping = False
+        self.start_button.setEnabled(not self._close_requested)
         self.stop_button.setEnabled(False)
+        if self._close_requested:
+            QTimer.singleShot(0, self.close)
+        elif self._restart_after_stop:
+            self._restart_after_stop = False
+            QTimer.singleShot(0, self.start_pipeline)
 
     def closeEvent(self, event: QCloseEvent) -> None:
-        self.stop_pipeline()
+        self._close_requested = True
+        self._restart_after_stop = False
+        if self.worker is not None and (self.worker.isRunning() or not self.worker.wait(0)):
+            event.ignore()
+            self.stop_pipeline()
+            return
+        self._shutdown_timer.stop()
         event.accept()
 
 

@@ -3,6 +3,10 @@ projection_features: 128
 hidden_size: 256
 num_lstm_layers: 2
 bidirectional: true
+model_type: bilstm_attention
+recurrent_dropout: 0.35
+weight_decay: 0.001
+feature_alignment: dominant_right_neutral_prefix_v1
 confidence_threshold: 0.3
 margin_threshold: 0.15
 

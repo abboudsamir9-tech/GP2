@@ -11,7 +11,7 @@ from asl_stereo.contracts import FEATURE_COUNT, FeatureVector, JOINT_COUNT
 
 from .feature_encoder import encode_feature_vector
 from .interpolation import interpolate_short_nan_gaps
-from .normalization import normalize_landmarks
+from .normalization import normalize_landmarks, normalize_landmark_sequence
 from .smoothing import smooth_trajectories
 
 
@@ -109,14 +109,10 @@ class PreprocessingPipeline:
             window_length=self.config.savgol_window_length,
             polyorder=self.config.savgol_polyorder,
         )
-        output = np.empty((smoothed.shape[0], FEATURE_COUNT), dtype=np.float32)
-        for index, frame in enumerate(smoothed):
-            output[index] = encode_feature_vector(
-                normalize_landmarks(
-                    frame, epsilon=self.config.normalization_epsilon
-                )
-            )
-        return np.ascontiguousarray(output)
+        normalized = normalize_landmark_sequence(
+            smoothed, epsilon=self.config.normalization_epsilon,
+        )
+        return normalized.reshape(smoothed.shape[0], FEATURE_COUNT)
 
     def process_live_window(
         self, sequence: npt.ArrayLike

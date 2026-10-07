@@ -1,0 +1,503 @@
+{
+  "test_accuracy": 0.6086956521739131,
+  "test_video_count": 23,
+  "test_window_count": 25,
+  "window_accuracy": 0.6,
+  "per_class": {
+    "BYE": {
+      "precision": 0.3333333333333333,
+      "recall": 0.2,
+      "f1": 0.25,
+      "support": 5
+    },
+    "HELLO": {
+      "precision": 0.75,
+      "recall": 0.75,
+      "f1": 0.75,
+      "support": 4
+    },
+    "NO": {
+      "precision": 1.0,
+      "recall": 0.25,
+      "f1": 0.4,
+      "support": 4
+    },
+    "THANK YOU": {
+      "precision": 0.8,
+      "recall": 0.8,
+      "f1": 0.8000000000000002,
+      "support": 5
+    },
+    "YES": {
+      "precision": 0.5,
+      "recall": 1.0,
+      "f1": 0.6666666666666666,
+      "support": 5
+    }
+  },
+  "class_order": [
+    "BYE",
+    "HELLO",
+    "NO",
+    "THANK YOU",
+    "YES"
+  ],
+  "confusion_matrix": [
+    [
+      1,
+      1,
+      0,
+      0,
+      3
+    ],
+    [
+      0,
+      3,
+      0,
+      1,
+      0
+    ],
+    [
+      1,
+      0,
+      1,
+      0,
+      2
+    ],
+    [
+      1,
+      0,
+      0,
+      4,
+      0
+    ],
+    [
+      0,
+      0,
+      0,
+      0,
+      5
+    ]
+  ],
+  "group_key": "signer_id",
+  "evaluation_scope": "unseen_signers",
+  "best_validation_accuracy": 0.8695652173913043,
+  "best_validation_loss": 0.6998731157054072,
+  "best_validation_macro_f1": 0.8764790764790764,
+  "best_validation_all_classes_recalled": true,
+  "macro_f1": 0.5733333333333334,
+  "target_accuracy": 0.85,
+  "target_accuracy_met": false,
+  "best_checkpoint_epoch": 20,
+  "epochs_completed": 40,
+  "training_config": {
+    "max_epochs": 60,
+    "cpu_num_threads": 1,
+    "export_cpu_num_threads": 1,
+    "patience": 20,
+    "min_epochs": 30,
+    "learning_rate": 0.001,
+    "weight_decay": 0.001,
+    "warmup_epochs": 5,
+    "loss": "weighted_label_smoothed_cross_entropy",
+    "label_smoothing": 0.1,
+    "checkpoint_selection": "validation_recall_coverage_then_macro_f1_with_loss_tiebreak",
+    "class_weights": [
+      0.8891909718513489,
+      1.0438328981399536,
+      1.1432455778121948,
+      0.9233906269073486,
+      1.0003398656845093
+    ],
+    "class_weight_normalization": "arithmetic_mean_one_then_clamp",
+    "class_weight_bounds": [
+      0.8,
+      1.6
+    ],
+    "temporal_features": "position_plus_first_difference_plus_hand_aperture_plus_thumb_finger_closure_plus_wrist_height",
+    "internal_feature_dim": 288,
+    "hand_elevation": {
+      "wrist_joints": [
+        0,
+        21
+      ],
+      "reference_joints": [
+        42,
+        43
+      ],
+      "reference": "shoulder_midpoint_y",
+      "coordinate_system": "shoulder_normalized",
+      "absent_hand_height": 0.0
+    },
+    "hand_closure": {
+      "joint_pairs": [
+        [
+          4,
+          8
+        ],
+        [
+          4,
+          12
+        ]
+      ],
+      "hand_offsets": [
+        0,
+        21
+      ],
+      "coordinate_system": "shoulder_normalized"
+    },
+    "hand_aperture": {
+      "tips": [
+        8,
+        12,
+        4
+      ],
+      "palm_mcp": 9,
+      "hand_offsets": [
+        0,
+        21
+      ],
+      "normalization": "tip_to_wrist_distance_divided_by_wrist_to_middle_mcp_distance"
+    },
+    "augmentation": {
+      "gaussian_noise_std": 0.015,
+      "scale_range": [
+        0.92,
+        1.08
+      ],
+      "speed_range": [
+        0.85,
+        1.15
+      ],
+      "temporal_resampling": "torch_linear_interpolate_then_center_crop_or_repeat_pad",
+      "rotation_degrees": [
+        -5.0,
+        5.0
+      ]
+    },
+    "scheduler": "five_epoch_linear_warmup_then_cosine_annealing"
+  },
+  "split_summary": {
+    "train": {
+      "windows": 121,
+      "videos": 102,
+      "groups": 26,
+      "signers": 26,
+      "signer_ids": [
+        "P12",
+        "P14",
+        "P15",
+        "P16",
+        "P17",
+        "P18",
+        "P2",
+        "P21",
+        "P22",
+        "P23",
+        "P24",
+        "P26",
+        "P29",
+        "P30",
+        "P31",
+        "P35",
+        "P36",
+        "P39",
+        "P40",
+        "P41",
+        "P43",
+        "P46",
+        "P47",
+        "P50",
+        "P51",
+        "P9"
+      ],
+      "video_ids": [
+        "0006320057552187119",
+        "0022932153577568393",
+        "01379619951634381",
+        "014439537236845323",
+        "020030442376253177",
+        "021145910536055412",
+        "029563612799205163",
+        "031705941185190545",
+        "048776623388550044",
+        "05574938180658928",
+        "05614933522741539",
+        "06476990357042611",
+        "0755679379568106",
+        "081380748015633",
+        "08228267952066615",
+        "08583141071601874",
+        "0912245735671211",
+        "09460259361998125",
+        "11225598264242453",
+        "1340650432799635",
+        "1555998439795525",
+        "15689453699180178",
+        "16270426237316316",
+        "16493550450776628",
+        "16501735528077632",
+        "16870669316247833",
+        "17487361670794144",
+        "1789715889624135",
+        "20675411351630046",
+        "2140134632834978",
+        "25802117645943423",
+        "26056519285644875",
+        "274897834577152",
+        "2889010159260097",
+        "31198466578073125",
+        "32542343160867326",
+        "370678413428154",
+        "38970444942928073",
+        "3919396171653571",
+        "41279108584600577",
+        "42327270691916885",
+        "4327026387490418",
+        "4578901677582461",
+        "4624064779710624",
+        "4656606080155459",
+        "5018242902938022",
+        "5023793115629094",
+        "5082858473744953",
+        "516342335411355",
+        "5278795760893484",
+        "5309657970849855",
+        "5328649685588343",
+        "5372668319999747",
+        "541403296602635",
+        "5631016440125773",
+        "5911924789322505",
+        "5932207271660643",
+        "5974251648548923",
+        "6137110171725737",
+        "6225526845167895",
+        "6645554412949413",
+        "6788237257016723",
+        "6912280773625425",
+        "6936836055005255",
+        "7027473793210652",
+        "7072634397394595",
+        "7076961883712545",
+        "709429051156695",
+        "7199140986089654",
+        "7199652013477922",
+        "7472491282176557",
+        "7525332129995586",
+        "7535449770372906",
+        "7597723277213178",
+        "7648996670040624",
+        "7931075492698656",
+        "7973429116215278",
+        "7976564165646398",
+        "8079226457278508",
+        "8323715285073319",
+        "8364377695946923",
+        "8779944008396092",
+        "8852825102646966",
+        "8920807082520505",
+        "8977694836593926",
+        "9008261925178431",
+        "9009854854743657",
+        "9092689562509508",
+        "9133589855079114",
+        "9161842981344352",
+        "9203138462369036",
+        "936211950052861",
+        "9404479880375034",
+        "9605571410103191",
+        "9616432008129339",
+        "9682333715513665",
+        "9710569622157019",
+        "9715589334909431",
+        "9782863224987515",
+        "9953610281521326",
+        "9962081495357855",
+        "9979731168048327"
+      ],
+      "class_counts": [
+        27,
+        23,
+        21,
+        26,
+        24
+      ],
+      "windows_per_gloss": {
+        "BYE": 27,
+        "HELLO": 23,
+        "NO": 21,
+        "THANK YOU": 26,
+        "YES": 24
+      },
+      "videos_per_gloss": {
+        "BYE": 19,
+        "HELLO": 22,
+        "NO": 21,
+        "THANK YOU": 20,
+        "YES": 20
+      }
+    },
+    "val": {
+      "windows": 23,
+      "videos": 23,
+      "groups": 6,
+      "signers": 6,
+      "signer_ids": [
+        "P10",
+        "P27",
+        "P37",
+        "P42",
+        "P49",
+        "P7"
+      ],
+      "video_ids": [
+        "011053589241707185",
+        "09714329486323847",
+        "15769775934939156",
+        "21550036390436733",
+        "2223181186410932",
+        "2732741727030885",
+        "3283413810240037",
+        "32941176670637984",
+        "35156313213734314",
+        "36995928249155363",
+        "44146024789241256",
+        "46074251080029494",
+        "5254351100197965",
+        "5327840336837257",
+        "5723102083146778",
+        "6528064521146906",
+        "7613696736100914",
+        "8486809407942575",
+        "8487114823108493",
+        "8699610978899361",
+        "9441415075906014",
+        "9644130188424822",
+        "9701695309294336"
+      ],
+      "class_counts": [
+        5,
+        5,
+        4,
+        5,
+        4
+      ],
+      "windows_per_gloss": {
+        "BYE": 5,
+        "HELLO": 5,
+        "NO": 4,
+        "THANK YOU": 5,
+        "YES": 4
+      },
+      "videos_per_gloss": {
+        "BYE": 5,
+        "HELLO": 5,
+        "NO": 4,
+        "THANK YOU": 5,
+        "YES": 4
+      }
+    },
+    "test": {
+      "windows": 25,
+      "videos": 23,
+      "groups": 6,
+      "signers": 6,
+      "signer_ids": [
+        "P1",
+        "P11",
+        "P33",
+        "P34",
+        "P48",
+        "P6"
+      ],
+      "video_ids": [
+        "034197610787212396",
+        "050364485120873326",
+        "09905526235759088",
+        "15498675309554577",
+        "16728596536749274",
+        "25130175957831113",
+        "3247833356457248",
+        "374824970052654",
+        "38351738059429663",
+        "39425766670939555",
+        "5339916560192981",
+        "6448349493816601",
+        "6508465822424006",
+        "6785992819227267",
+        "6825474983576931",
+        "6901051427765104",
+        "7057474129672285",
+        "7442618628569746",
+        "7932042062420475",
+        "8841964348021558",
+        "9042145214602195",
+        "9542027365188674",
+        "9729998715398667"
+      ],
+      "class_counts": [
+        6,
+        4,
+        4,
+        5,
+        6
+      ],
+      "windows_per_gloss": {
+        "BYE": 6,
+        "HELLO": 4,
+        "NO": 4,
+        "THANK YOU": 5,
+        "YES": 6
+      },
+      "videos_per_gloss": {
+        "BYE": 5,
+        "HELLO": 4,
+        "NO": 4,
+        "THANK YOU": 5,
+        "YES": 5
+      }
+    }
+  },
+  "metadata_alignment": {
+    "metadata_csv": "C:\\Users\\desgin\\Documents\\ChatGPT\\New project\\data\\data.csv",
+    "matched_videos": 148,
+    "matched_windows": 169,
+    "unique_signers": 38,
+    "unmatched_video_ids": []
+  },
+  "split_seed": 42,
+  "split_method": "video_level_StratifiedGroupKFold_with_signer_isolation",
+  "minimum_test_videos_per_class": 4,
+  "existing_test_signers_preserved": true,
+  "optimized_model_test_accuracy": 0.6086956521739131,
+  "optimized_target_accuracy_met": false,
+  "optimized_model_confusion_matrix": [
+    [1, 1, 0, 0, 3],
+    [0, 3, 0, 1, 0],
+    [1, 0, 1, 0, 2],
+    [1, 0, 0, 4, 0],
+    [0, 0, 0, 0, 5]
+  ],
+  "optimized_model_per_class": {
+    "BYE": {"precision": 0.3333333333333333, "recall": 0.2, "f1": 0.25, "support": 5},
+    "HELLO": {"precision": 0.75, "recall": 0.75, "f1": 0.75, "support": 4},
+    "NO": {"precision": 1.0, "recall": 0.25, "f1": 0.4, "support": 4},
+    "THANK YOU": {"precision": 0.8, "recall": 0.8, "f1": 0.8000000000000002, "support": 5},
+    "YES": {"precision": 0.5, "recall": 1.0, "f1": 0.6666666666666666, "support": 5}
+  },
+  "optimized_model_path": "C:/Users/desgin/Documents/ChatGPT/New project/weights/optimized_model.pt",
+  "model_artifact_verification": {
+    "window_prediction_agreement": 1.0,
+    "max_probability_difference": 0.01318347454071045,
+    "latency_gate_passed": true,
+    "benchmark_report": "reports/quantization_benchmark.json"
+  },
+  "comparison_to_previous_run": {
+    "previous_accuracy": 0.7391304347826086,
+    "previous_correct_videos": 17,
+    "current_correct_videos": 14,
+    "same_test_signers": true,
+    "same_test_videos": true,
+    "previous_artifacts_backup": "artifacts/training_history/pre_wrist_height_20261005_210112"
+  }
+}

@@ -29,7 +29,7 @@ from asl_stereo.stereo import StereoCalibration, StereoMatcher  # noqa: E402
 WINDOW_TITLE = "ASL Live Test"
 CAPTURE_RESOLUTION = (1280, 720)
 DISPLAY_RESOLUTION = (640, 360)
-REQUESTED_FPS = 60.0
+REQUESTED_FPS = 30.0
 INFERENCE_STRIDE = 6
 CAMERA_INDICES = (0, 1, 2)
 NO_FRAME_TIMEOUT_S = 5.0
@@ -74,6 +74,41 @@ class FpsMeter:
                 self.fps = instantaneous if self.fps == 0 else 0.9 * self.fps + 0.1 * instantaneous
         self._last_time = now
         return self.fps
+
+
+class ProfileAccumulator:
+    """Bounded, 30-frame averages; asynchronous stage timers may overlap."""
+
+    def __init__(self) -> None:
+        self._count = 0
+        self._totals = np.zeros(7, dtype=np.float64)
+
+    def add(self, *, capture_ms: float, extractor_timings: tuple,
+            norm_buffer_ms: float, total_ms: float, measured_fps: float) -> None:
+        stages = [sum(getattr(item, name, 0.0) for item in extractor_timings if item is not None)
+                  for name in ("resize_ms", "pose_ms", "hands_ms")]
+        self._totals += (capture_ms, *stages, norm_buffer_ms, total_ms, measured_fps)
+        self._count += 1
+        if self._count < 30:
+            return
+        capture, resize, pose, hands, norm, total, fps = self._totals / self._count
+        print(f"[PROFILE] Capture: {capture:.1f} ms | Resize: {resize:.1f} ms | "
+              f"Pose: {pose:.1f} ms | Hands: {hands:.1f} ms | Norm/Buffering: {norm:.1f} ms | "
+              f"Total: {total:.1f} ms | Measured FPS: {fps:.1f}", flush=True)
+        slow = [name for name, value in zip(("capture", "resize", "pose", "hands", "norm/buffering"),
+                                            (capture, resize, pose, hands, norm), strict=True) if value > 15.0]
+        if slow:
+            print("[PROFILE] Operations over 15 ms: " + ", ".join(slow), flush=True)
+        self._totals.fill(0.0)
+        self._count = 0
+
+
+class ExtractionWorker(threading.Thread):
+    """Consumes only latest frames; capture and display remain independent."""
+
+    def __init__(self, front: CameraWorker, side: CameraWorker | None, *args) -> None:
+        super().__init__(target=_vision_loop, args=(front, side, *args),
+                         name="asl-live-extraction", daemon=True)
 
 
 @dataclass(slots=True)
@@ -198,7 +233,7 @@ def _open_camera(
                 flush=True,
             )
             if actual_fps is None:
-                print("[WARNING] Driver did not report FPS; requested 60 FPS.", flush=True)
+                print(f"[WARNING] Driver did not report FPS; requested {REQUESTED_FPS:.0f} FPS.", flush=True)
             elif actual_fps < REQUESTED_FPS - 0.5:
                 print(
                     f"[WARNING] Hardware capped at {actual_fps:.1f} FPS. "
@@ -256,7 +291,8 @@ def _report_prediction(
     engine: InferenceEngine,
     confidence_threshold: float,
     state: LiveState,
-) -> None:
+) -> float:
+    buffer_started = time.perf_counter()
     pose_visible = bool(np.isfinite(coordinates[42:46]).all())
     hand_visible = bool(landmarks.hand_present.any())
     window = buffer.append_landmarks(
@@ -264,6 +300,7 @@ def _report_prediction(
         timestamp_ns=landmarks.timestamp_ns,
         preprocessor=preprocessor,
     )
+    buffer_ms = (time.perf_counter() - buffer_started) * 1000.0
     if not pose_visible or not hand_visible:
         if frame_count % 30 == 0:
             print(
@@ -271,9 +308,9 @@ def _report_prediction(
                 "(shoulders, elbows, and at least one hand required)...",
                 flush=True,
             )
-        return
+        return buffer_ms
     if window is None:
-        return
+        return buffer_ms
 
     result = engine.predict(window)
     decision = engine.gate_prediction(
@@ -295,6 +332,7 @@ def _report_prediction(
         f"| Inference: {result.latency_ms:.1f} ms",
         flush=True,
     )
+    return buffer_ms
 
 
 def run(
@@ -320,34 +358,29 @@ def run(
         )
         side: CameraWorker | None = None
         first_side: TimestampedFrame | None = None
-        if not single_camera:
-            try:
-                side, _, first_side = _open_camera(
-                    stack, side_index, camera_id="side", excluded={selected_front}
-                )
-            except RuntimeError as error:
-                print(f"[WARNING] {error}. Entering single-camera mode.", flush=True)
         calibration = StereoCalibration()
-        if side is not None:
+        if not single_camera:
             try:
                 calibration = StereoCalibration.from_default(
                     PROJECT_ROOT / "configs" / "calibration_params.json"
                 )
             except (OSError, ValueError) as error:
-                print(
-                    f"[WARNING] Stereo calibration unavailable: {error}. "
-                    "Using front-camera coordinates.",
-                    flush=True,
-                )
+                print(f"[WARNING] Stereo calibration unavailable: {error}", flush=True)
+            if not calibration.available:
+                print("[WARNING] Stereo calibration missing. Entering single-camera mode.", flush=True)
+            else:
+                try:
+                    side, _, first_side = _open_camera(
+                        stack, side_index, camera_id="side", excluded={selected_front}
+                    )
+                except RuntimeError as error:
+                    print(f"[WARNING] {error}. Entering single-camera mode.", flush=True)
         state = LiveState(side_camera=side)
         stop_event = threading.Event()
         errors: list[Exception] = []
-        vision = threading.Thread(
-            target=_vision_loop,
-            args=(front, side, first_front, first_side, calibration, engine,
-                  confidence_threshold, state, stop_event, errors),
-            name="asl-live-vision",
-            daemon=True,
+        vision = ExtractionWorker(
+            front, side, first_front, first_side, calibration, engine,
+            confidence_threshold, state, stop_event, errors,
         )
         vision.start()
         try:
@@ -377,14 +410,19 @@ def _vision_loop(
             side_extractor = extractors.enter_context(PoseHandsExtractor()) if side else None
             meter = FpsMeter()
             preprocessor = LiveWindowPreprocessor()
-            buffer = SlidingWindowBuffer(window_size=45, stride=INFERENCE_STRIDE)
+            buffer = SlidingWindowBuffer(
+                window_size=45, stride=INFERENCE_STRIDE,
+                align_features=bool(getattr(engine, "feature_alignment_enabled", False)),
+            )
             matcher = StereoMatcher(calibration, fallback_scope="frame")
             synchronizer = Synchronizer()
             last_frame_time = time.monotonic()
             last_pair_time = last_frame_time
             frame_count = 0
+            profiler = ProfileAccumulator()
 
             while front.is_running and not stop_event.is_set():
+                cycle_started = time.perf_counter()
                 if side is not None and not side.is_running:
                     print("[WARNING] Side camera stopped. Entering single-camera mode.", flush=True)
                     side = None
@@ -412,11 +450,17 @@ def _vision_loop(
                         state.front_landmarks = landmarks
                         state.front_results = front_extractor.last_results
                         state.extraction_fps = fps
-                    _report_prediction(
+                    norm_ms = _report_prediction(
                         landmarks, landmarks.coordinates, fps=fps,
                         frame_count=frame_count, buffer=buffer,
                         preprocessor=preprocessor, engine=engine,
                         confidence_threshold=confidence_threshold, state=state,
+                    )
+                    profiler.add(
+                        capture_ms=record.health_meta.get("capture_read_ms", getattr(front, "capture_read_ms", 0.0)),
+                        extractor_timings=(getattr(front_extractor, "last_timings", None),),
+                        norm_buffer_ms=norm_ms,
+                        total_ms=(time.perf_counter() - cycle_started) * 1000.0, measured_fps=fps,
                     )
                     frame_count += 1
                     continue
@@ -454,6 +498,7 @@ def _vision_loop(
                         state.side_results = side_extractor.last_results
                         state.extraction_fps = fps
                     coordinates = front_landmarks.coordinates
+                    fusion_started = time.perf_counter()
                     if calibration.available:
                         coordinates = matcher.match(
                             _normalized_to_pixels(coordinates, pair.front.frame_buffer.shape),
@@ -462,11 +507,19 @@ def _vision_loop(
                             ),
                             front_fallback=coordinates,
                         ).coordinates
-                    _report_prediction(
+                    fusion_ms = (time.perf_counter() - fusion_started) * 1000.0
+                    norm_ms = _report_prediction(
                         front_landmarks, coordinates, fps=fps,
                         frame_count=frame_count, buffer=buffer,
                         preprocessor=preprocessor, engine=engine,
                         confidence_threshold=confidence_threshold, state=state,
+                    )
+                    profiler.add(
+                        capture_ms=max(getattr(front, "capture_read_ms", 0.0), getattr(side, "capture_read_ms", 0.0)),
+                        extractor_timings=(getattr(front_extractor, "last_timings", None),
+                                           getattr(side_extractor, "last_timings", None)),
+                        norm_buffer_ms=norm_ms + fusion_ms,
+                        total_ms=(time.perf_counter() - cycle_started) * 1000.0, measured_fps=fps,
                     )
                     frame_count += 1
                 elif time.monotonic() - last_pair_time > NO_PAIR_TIMEOUT_S:

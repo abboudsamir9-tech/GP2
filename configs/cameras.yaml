@@ -1,5 +1,8 @@
 front_camera_id: 0
 side_camera_id: 1
+front_index: 0
+side_index: 1
+stereo_enabled: false
 target_fps: 30
 buffer_size: 1
 sync_tolerance_ms: 40

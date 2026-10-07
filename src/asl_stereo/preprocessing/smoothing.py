@@ -34,15 +34,23 @@ def smooth_trajectories(
 
     original_shape = values.shape
     result = values.astype(np.float64, copy=True).reshape(values.shape[0], -1)
-    if result.shape[0] < window_length:
+    if result.shape[0] < window_length or result.shape[1] == 0:
         return np.ascontiguousarray(result.reshape(original_shape), dtype=np.float32)
 
-    for channel_index in range(result.shape[1]):
-        channel = result[:, channel_index]
-        if np.isnan(channel).any():
-            continue
-        result[:, channel_index] = savgol_filter(
-            channel,
+    complete = ~np.isnan(result).any(axis=0)
+    if complete.all():
+        result = savgol_filter(
+            result,
+            window_length=window_length,
+            polyorder=polyorder,
+            axis=0,
+            mode="interp",
+        )
+    elif complete.any():
+        # A single multi-output fit preserves the per-channel boundary rule.
+        # Channels with any unresolved NaN remain entirely unchanged.
+        result[:, complete] = savgol_filter(
+            result[:, complete],
             window_length=window_length,
             polyorder=polyorder,
             axis=0,

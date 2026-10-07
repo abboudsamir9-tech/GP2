@@ -47,6 +47,9 @@ def test_settings_threshold_slider_updates_configuration(qt_application) -> None
     assert settings.confidence_threshold == pytest.approx(0.78)
     assert dialog.confidence_value.text() == "0.78"
 
+    dialog.stereo_checkbox.setChecked(True)
+    assert settings.stereo_enabled is True
+
 
 def test_frame_mailbox_coalesces_pending_updates(qt_application) -> None:
     worker = PipelineWorker(RuntimeSettings())

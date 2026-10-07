@@ -52,12 +52,15 @@ class InferenceEngine:
         strict_weights: bool = True,
     ) -> None:
         self.device = torch.device("cpu")
+        self.feature_alignment_enabled = bool(getattr(model, "feature_alignment_enabled", False))
         self.class_map = load_class_map(class_map)
         self.model = model.to(self.device)
         if checkpoint_path is not None:
             self.model = self._load_artifact(
                 Path(checkpoint_path), strict_weights=strict_weights
             )
+        if not isinstance(self.model, torch.jit.ScriptModule):
+            self.feature_alignment_enabled = bool(getattr(self.model, "feature_alignment_enabled", False))
         expected_classes = getattr(self.model, "num_classes", None)
         if expected_classes is not None and expected_classes != len(self.class_map):
             raise ValueError("class map size does not match model num_classes")
@@ -104,6 +107,10 @@ class InferenceEngine:
         embedded_map = metadata.get("class_map")
         if embedded_map is not None and load_class_map(embedded_map) != self.class_map:
             raise ValueError("class map does not match TorchScript metadata")
+        alignment = metadata.get("feature_alignment", "none")
+        if alignment not in ("none", "dominant_right_neutral_prefix_v1"):
+            raise ValueError("unsupported feature alignment version")
+        self.feature_alignment_enabled = alignment != "none"
 
     def predict(
         self, window: torch.Tensor | npt.NDArray[np.float32]

@@ -13,6 +13,8 @@ from PyQt5.QtWidgets import QApplication
 from asl_stereo.contracts import LandmarkFrame, TimestampedFrame
 from asl_stereo.models.inference import InferenceResult
 from asl_stereo.preprocessing import PreprocessingPipeline, SlidingWindowBuffer
+from asl_stereo.stereo import StereoCalibration
+from tests.fixtures.synthetic_cameras import make_projection_matrices
 from tests.fixtures.synthetic_landmarks import make_landmark_frame
 from ui import MainWindow, PipelineWorker, RuntimeSettings, SettingsDialog
 
@@ -28,7 +30,8 @@ def test_gui_defaults_to_diagnostic_confidence_floor(app) -> None:
     worker = PipelineWorker(settings)
 
     assert settings.confidence_threshold == pytest.approx(0.40)
-    assert settings.front_camera_index == 1
+    assert settings.front_camera_index == 0
+    assert settings.stereo_enabled is False
     assert dialog.confidence_slider.minimum() <= 35
     worker.update_confidence_threshold(0.40)
     assert worker._confidence_threshold == pytest.approx(0.40)
@@ -78,6 +81,57 @@ def test_front_camera_discovery_accepts_camera_one_after_zero_fails(app) -> None
     assert chosen is not None and chosen.index == 1
     assert frame.frame_buffer.shape == (2, 2, 3)
     chosen.stop()
+
+
+@pytest.mark.parametrize(
+    ("stereo_enabled", "calibrated"),
+    [(True, False), (False, True)],
+)
+def test_single_camera_mode_skips_side_camera(
+    app, monkeypatch, caplog, stereo_enabled: bool, calibrated: bool
+) -> None:
+    opened: list[str] = []
+
+    class FakeCamera:
+        actual_fps = 30.0
+        last_error = None
+
+        def __init__(self, index: int, *, camera_id: str, **kwargs) -> None:
+            opened.append(camera_id)
+            self.is_running = True
+
+        def start(self, *, timeout: float) -> None:
+            pass
+
+        def get_frame(self, *, timeout: float = 0.0) -> TimestampedFrame:
+            return TimestampedFrame(
+                camera_id="front", frame_index=0, timestamp_ns=1,
+                frame_buffer=np.zeros((2, 2, 3), dtype=np.uint8), health_meta={},
+            )
+
+        def request_stop(self) -> None:
+            pass
+
+        def stop(self) -> None:
+            self.is_running = False
+
+    calibration = (
+        StereoCalibration(*make_projection_matrices())
+        if calibrated else StereoCalibration()
+    )
+    worker = PipelineWorker(
+        RuntimeSettings(front_camera_index=0, side_camera_index=1,
+                        stereo_enabled=stereo_enabled),
+        calibration=calibration, camera_factory=FakeCamera,
+    )
+    monkeypatch.setattr(worker, "_load_default_engine", lambda: None)
+    monkeypatch.setattr(worker, "_vision_loop", lambda *args: None)
+    monkeypatch.setattr(worker, "_display_loop", lambda camera: worker.stop())
+
+    worker.run()
+
+    assert opened == ["front"]
+    assert ("Stereo calibration unavailable" in caplog.text) is not calibrated
 
 
 def test_one_handed_live_window_emits_finite_tensor(app) -> None:

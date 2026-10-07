@@ -1,0 +1,295 @@
+{
+  "scope": "training_and_validation_only",
+  "test_features_read": false,
+  "split_membership_sha256": "151e160a9a1be4b3b1ed294dde81348d367ddbe0f84f463f079bf724667d15e5",
+  "data_implementation_directory": "src/asl_stereo/dataset (there is no src/asl_stereo/data package)",
+  "alignment": {
+    "default_config": {
+      "max_interpolation_gap": 4,
+      "savgol_window_length": 7,
+      "savgol_polyorder": 2,
+      "normalization_epsilon": 1e-06
+    },
+    "smoothing_dtype": "float64 arithmetic, float32 output",
+    "savgol_mode": "interp",
+    "offline_live_45_frame_max_abs_difference": 0.0,
+    "temporal_buffer_live_max_abs_difference": 0.0,
+    "inactive_left_hand_zero_in_offline": true,
+    "inactive_left_hand_zero_in_live": true,
+    "three_frame_interior_gap_interpolated": true,
+    "boundary_context_difference": {
+      "offline_can_fill_gap_using_future_frames": true,
+      "live_boundary_remaining_nan_count": 0,
+      "live_trailing_hand_gap_neutralized": true,
+      "max_abs_difference": 0.7139987945556641,
+      "explanation": "Full-clip context fills the gap; rolling context can classify a trailing tracking loss as neutral absence. Parameters match, outputs can differ."
+    },
+    "buffer_default_window_size": 45,
+    "buffer_default_stride": 8,
+    "gui_and_harness_runtime_stride": 6
+  },
+  "feature_statistics": {
+    "features_shape": [
+      144,
+      45,
+      138
+    ],
+    "features_dtype": "float32",
+    "finite": true,
+    "max_shoulder_origin_error": 0.0,
+    "max_shoulder_scale_error": 5.960464477539063e-08,
+    "per_class": {
+      "BYE": {
+        "windows": 32,
+        "videos": 24,
+        "left_neutral_frame_fraction": 0.5333333333333333,
+        "right_neutral_frame_fraction": 0.2388888888888889,
+        "left_dominant_windows": 9,
+        "right_dominant_windows": 16,
+        "mixed_single_hand_side_windows": 0,
+        "both_hands_present_frame_fraction": 0.2673611111111111,
+        "potential_swapped_assignment_frames": 0
+      },
+      "HELLO": {
+        "windows": 28,
+        "videos": 27,
+        "left_neutral_frame_fraction": 0.7865079365079365,
+        "right_neutral_frame_fraction": 0.29523809523809524,
+        "left_dominant_windows": 7,
+        "right_dominant_windows": 21,
+        "mixed_single_hand_side_windows": 0,
+        "both_hands_present_frame_fraction": 0.0,
+        "potential_swapped_assignment_frames": 0
+      },
+      "NO": {
+        "windows": 25,
+        "videos": 25,
+        "left_neutral_frame_fraction": 0.7928888888888889,
+        "right_neutral_frame_fraction": 0.30666666666666664,
+        "left_dominant_windows": 6,
+        "right_dominant_windows": 19,
+        "mixed_single_hand_side_windows": 0,
+        "both_hands_present_frame_fraction": 0.0,
+        "potential_swapped_assignment_frames": 0
+      },
+      "THANK YOU": {
+        "windows": 31,
+        "videos": 25,
+        "left_neutral_frame_fraction": 0.807168458781362,
+        "right_neutral_frame_fraction": 0.3419354838709677,
+        "left_dominant_windows": 7,
+        "right_dominant_windows": 24,
+        "mixed_single_hand_side_windows": 0,
+        "both_hands_present_frame_fraction": 0.0,
+        "potential_swapped_assignment_frames": 0
+      },
+      "YES": {
+        "windows": 28,
+        "videos": 24,
+        "left_neutral_frame_fraction": 0.830952380952381,
+        "right_neutral_frame_fraction": 0.23333333333333334,
+        "left_dominant_windows": 6,
+        "right_dominant_windows": 22,
+        "mixed_single_hand_side_windows": 0,
+        "both_hands_present_frame_fraction": 0.0,
+        "potential_swapped_assignment_frames": 0
+      }
+    }
+  },
+  "hand_assignment": {
+    "shared_extractor": "PoseHandsExtractor for offline, GUI, and harness",
+    "default_input_is_mirrored": false,
+    "label_policy": "Swap MediaPipe selfie labels for unmirrored OpenCV input; no coordinate inversion applied.",
+    "source": "https://chuoling.github.io/mediapipe/solutions/hands.html#multi_handedness",
+    "fallback": "Nearest same-side elbow/shoulder only when handedness unavailable or duplicated.",
+    "dominant_hand_canonicalization": "None; left- and right-dominant signing remain distinct inputs.",
+    "limitation": "No ground-truth handedness or mirror flag in HDF5; dataset-wide correctness cannot be certified."
+  },
+  "findings": [
+    {
+      "severity": "pass",
+      "issue": "Common window-7/order-2 float64 Savitzky-Golay configuration."
+    },
+    {
+      "severity": "risk",
+      "issue": "Clip-global vs 45-frame hand-presence inference and interpolation context differ at boundaries."
+    },
+    {
+      "severity": "risk",
+      "issue": "canonicalize_hand_presence can neutralize a real secondary hand detected fewer than max(3, 50% of dominant detections) frames."
+    },
+    {
+      "severity": "risk",
+      "issue": "Live valid-frame cadence compresses dropped frames; training uses decoded clip cadence. Temporal deltas are not timestamp-normalized."
+    },
+    {
+      "severity": "limitation",
+      "issue": "HDF5 has no extractor version, FPS, processing resolution, mirror flag, or Savitzky-Golay provenance; archived extraction settings are not fully auditable."
+    },
+    {
+      "severity": "observed",
+      "issue": "Possible handedness flicker in sampled raw training/validation clips.",
+      "video_ids": [
+        "0022932153577568393"
+      ],
+      "not_ground_truth_confirmed": true
+    },
+    {
+      "severity": "observed",
+      "issue": "HELLO and NO contain both left- and right-dominant windows; no dominant-hand canonicalization or mirroring augmentation is applied.",
+      "source": "training_and_validation_feature_statistics_only"
+    },
+    {
+      "severity": "observed",
+      "issue": "Short offline clips repeat-pad the final frame; live windows contain 45 real extraction steps instead. Identical math does not guarantee identical temporal context.",
+      "short_clips_in_diagnostic_sample": 9,
+      "checked_clips": 10
+    }
+  ],
+  "raw_clip_checks": [
+    {
+      "video_id": "011053589241707185",
+      "gloss": "BYE",
+      "active_frames": 24,
+      "accepted_windows": 1,
+      "rejected_windows": 0,
+      "detected_left_frames": 0,
+      "detected_right_frames": 24,
+      "suspicious_continuous_wrist_side_switches": [],
+      "like_for_like_context_max_abs_difference": 0.0,
+      "compared_windows": 1,
+      "alignment_check_used_simulated_repeat_padding": true,
+      "interpretation": "Side-switch flags are diagnostics, not verified anatomical annotation errors."
+    },
+    {
+      "video_id": "048776623388550044",
+      "gloss": "BYE",
+      "active_frames": 23,
+      "accepted_windows": 1,
+      "rejected_windows": 0,
+      "detected_left_frames": 23,
+      "detected_right_frames": 0,
+      "suspicious_continuous_wrist_side_switches": [],
+      "like_for_like_context_max_abs_difference": 0.0,
+      "compared_windows": 1,
+      "alignment_check_used_simulated_repeat_padding": true,
+      "interpretation": "Side-switch flags are diagnostics, not verified anatomical annotation errors."
+    },
+    {
+      "video_id": "0022932153577568393",
+      "gloss": "HELLO",
+      "active_frames": 48,
+      "accepted_windows": 1,
+      "rejected_windows": 0,
+      "detected_left_frames": 45,
+      "detected_right_frames": 6,
+      "suspicious_continuous_wrist_side_switches": [
+        44,
+        45
+      ],
+      "like_for_like_context_max_abs_difference": 0.0,
+      "compared_windows": 1,
+      "alignment_check_used_simulated_repeat_padding": false,
+      "interpretation": "Side-switch flags are diagnostics, not verified anatomical annotation errors."
+    },
+    {
+      "video_id": "020030442376253177",
+      "gloss": "HELLO",
+      "active_frames": 22,
+      "accepted_windows": 1,
+      "rejected_windows": 0,
+      "detected_left_frames": 4,
+      "detected_right_frames": 20,
+      "suspicious_continuous_wrist_side_switches": [],
+      "like_for_like_context_max_abs_difference": 0.0,
+      "compared_windows": 1,
+      "alignment_check_used_simulated_repeat_padding": true,
+      "interpretation": "Side-switch flags are diagnostics, not verified anatomical annotation errors."
+    },
+    {
+      "video_id": "01379619951634381",
+      "gloss": "NO",
+      "active_frames": 31,
+      "accepted_windows": 1,
+      "rejected_windows": 0,
+      "detected_left_frames": 0,
+      "detected_right_frames": 31,
+      "suspicious_continuous_wrist_side_switches": [],
+      "like_for_like_context_max_abs_difference": 0.0,
+      "compared_windows": 1,
+      "alignment_check_used_simulated_repeat_padding": true,
+      "interpretation": "Side-switch flags are diagnostics, not verified anatomical annotation errors."
+    },
+    {
+      "video_id": "08228267952066615",
+      "gloss": "NO",
+      "active_frames": 24,
+      "accepted_windows": 1,
+      "rejected_windows": 0,
+      "detected_left_frames": 0,
+      "detected_right_frames": 24,
+      "suspicious_continuous_wrist_side_switches": [],
+      "like_for_like_context_max_abs_difference": 0.0,
+      "compared_windows": 1,
+      "alignment_check_used_simulated_repeat_padding": true,
+      "interpretation": "Side-switch flags are diagnostics, not verified anatomical annotation errors."
+    },
+    {
+      "video_id": "0006320057552187119",
+      "gloss": "THANK YOU",
+      "active_frames": 21,
+      "accepted_windows": 1,
+      "rejected_windows": 0,
+      "detected_left_frames": 21,
+      "detected_right_frames": 0,
+      "suspicious_continuous_wrist_side_switches": [],
+      "like_for_like_context_max_abs_difference": 0.0,
+      "compared_windows": 1,
+      "alignment_check_used_simulated_repeat_padding": true,
+      "interpretation": "Side-switch flags are diagnostics, not verified anatomical annotation errors."
+    },
+    {
+      "video_id": "014439537236845323",
+      "gloss": "THANK YOU",
+      "active_frames": 29,
+      "accepted_windows": 1,
+      "rejected_windows": 0,
+      "detected_left_frames": 29,
+      "detected_right_frames": 3,
+      "suspicious_continuous_wrist_side_switches": [],
+      "like_for_like_context_max_abs_difference": 0.0,
+      "compared_windows": 1,
+      "alignment_check_used_simulated_repeat_padding": true,
+      "interpretation": "Side-switch flags are diagnostics, not verified anatomical annotation errors."
+    },
+    {
+      "video_id": "029563612799205163",
+      "gloss": "YES",
+      "active_frames": 33,
+      "accepted_windows": 1,
+      "rejected_windows": 0,
+      "detected_left_frames": 0,
+      "detected_right_frames": 33,
+      "suspicious_continuous_wrist_side_switches": [],
+      "like_for_like_context_max_abs_difference": 0.0,
+      "compared_windows": 1,
+      "alignment_check_used_simulated_repeat_padding": true,
+      "interpretation": "Side-switch flags are diagnostics, not verified anatomical annotation errors."
+    },
+    {
+      "video_id": "05574938180658928",
+      "gloss": "YES",
+      "active_frames": 17,
+      "accepted_windows": 1,
+      "rejected_windows": 0,
+      "detected_left_frames": 17,
+      "detected_right_frames": 0,
+      "suspicious_continuous_wrist_side_switches": [],
+      "like_for_like_context_max_abs_difference": 0.0,
+      "compared_windows": 1,
+      "alignment_check_used_simulated_repeat_padding": true,
+      "interpretation": "Side-switch flags are diagnostics, not verified anatomical annotation errors."
+    }
+  ],
+  "raw_frames_saved": false
+}

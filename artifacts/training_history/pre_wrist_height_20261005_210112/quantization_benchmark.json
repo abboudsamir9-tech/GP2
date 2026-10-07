@@ -1,0 +1,32 @@
+{
+  "input_contract": {
+    "shape": [
+      1,
+      45,
+      138
+    ],
+    "dtype": "float32",
+    "device": "cpu"
+  },
+  "benchmark": {
+    "warmup": 50,
+    "iterations": 200
+  },
+  "baseline_fp32": {
+    "file_size_mb": 9.685257911682129,
+    "mean_ms": 29.57644450000089,
+    "median_ms": 17.58595000023888,
+    "p95_ms": 52.201755000237135,
+    "peak_ram_mb": 0.007746696472167969
+  },
+  "optimized_int8_torchscript": {
+    "file_size_mb": 2.4800710678100586,
+    "mean_ms": 21.400892000008298,
+    "median_ms": 19.828700000061872,
+    "p95_ms": 32.70903999987234,
+    "peak_ram_mb": 0.00415802001953125
+  },
+  "latency_gate_ms": 80.0,
+  "latency_gate_passed": true,
+  "torch_version": "2.4.1+cpu"
+}

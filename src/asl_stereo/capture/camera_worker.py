@@ -49,11 +49,13 @@ def _open_cv_capture(source: CaptureSource) -> VideoCaptureLike:
     import cv2
 
     if sys.platform.startswith("win") and isinstance(source, int):
-        capture = cv2.VideoCapture(source, cv2.CAP_DSHOW)
-        if capture.isOpened():
-            return capture
-        capture.release()
+        return cv2.VideoCapture(source, cv2.CAP_DSHOW)
     return cv2.VideoCapture(source)
+
+
+def _open_msmf_capture(source: CaptureSource) -> VideoCaptureLike:
+    import cv2
+    return cv2.VideoCapture(source, cv2.CAP_MSMF)
 
 
 def _buffer_size_property() -> int:
@@ -97,6 +99,7 @@ class CameraWorker:
         resolution: tuple[int, int] | None = None,
         target_fps: float | None = None,
         capture_factory: CaptureFactory | None = None,
+        msmf_capture_factory: CaptureFactory | None = None,
         monotonic_ns: Callable[[], int] = time.monotonic_ns,
         failure_backoff_s: float = 0.005,
     ) -> None:
@@ -129,6 +132,9 @@ class CameraWorker:
         self.resolution = resolution
         self.target_fps = None if target_fps is None else float(target_fps)
         self._capture_factory = capture_factory or _open_cv_capture
+        self._msmf_capture_factory = msmf_capture_factory
+        if self._msmf_capture_factory is None and sys.platform.startswith("win") and isinstance(source, int):
+            self._msmf_capture_factory = _open_msmf_capture
         self._monotonic_ns = monotonic_ns
         self._failure_backoff_s = failure_backoff_s
 
@@ -139,32 +145,50 @@ class CameraWorker:
         self._stop_event = threading.Event()
         self._ready_event = threading.Event()
         self._state_lock = threading.RLock()
+        self._release_lock = threading.Lock()
         self._thread: CaptureThread | None = None
         self._capture: VideoCaptureLike | None = None
+        self._released_capture: VideoCaptureLike | None = None
+        self._release_thread: threading.Thread | None = None
+        self._release_error: Exception | None = None
         self._startup_error: BaseException | None = None
         self._startup_deadline = 0.0
         self._frame_index = 0
         self._capture_failures = 0
         self._backpressure_drops = 0
         self._actual_fps: float | None = None
+        self._backend_name = "UNKNOWN"
+        self._capture_read_ms = 0.0
 
     def start(self, *, timeout: float = 5.0) -> None:
-        """Start ingestion and wait until camera setup/warmup completes."""
-        if timeout <= 0:
-            raise ValueError("timeout must be positive")
+        """Wait for the first successful warmup read; discard the rest in-thread."""
+        if not np.isfinite(timeout) or timeout <= 0:
+            raise ValueError("timeout must be positive and finite")
         with self._state_lock:
+            if (
+                self._thread is not None and self._thread.is_alive()
+                and self._stop_event.is_set()
+            ) or (
+                self._release_thread is not None and self._release_thread.is_alive()
+            ) or self._release_error is not None:
+                raise RuntimeError(f"camera {self.camera_id!r} is still stopping")
             if self.is_running:
                 return
             self._stop_event.clear()
             self._ready_event.clear()
             self._startup_error = None
+            self._released_capture = None
+            self._release_thread = None
             self._startup_deadline = time.monotonic() + timeout
             self._thread = CaptureThread(self)
             self._thread.start()
 
         if not self._ready_event.wait(timeout):
-            self.stop(timeout=timeout)
+            self.stop(timeout=max(0.0, self._startup_deadline - time.monotonic()))
             raise TimeoutError(f"camera {self.camera_id!r} did not become ready")
+        if self._stop_event.is_set():
+            self.stop(timeout=max(0.0, self._startup_deadline - time.monotonic()))
+            raise RuntimeError(f"camera {self.camera_id!r} startup cancelled")
         if self._startup_error is not None:
             error = self._startup_error
             self.stop(timeout=timeout)
@@ -174,6 +198,16 @@ class CameraWorker:
         capture: VideoCaptureLike | None = None
         try:
             capture = self._capture_factory(self.source)
+            if self._stop_event.is_set():
+                return
+            if not capture.isOpened():
+                # Never hold a DirectShow device handle while opening MSMF.
+                capture.release()
+                capture = None
+                if self._msmf_capture_factory is not None and not self._stop_event.is_set():
+                    capture = self._msmf_capture_factory(self.source)
+                if capture is None:
+                    raise RuntimeError(f"unable to open camera source {self.source!r}")
             with self._state_lock:
                 self._capture = capture
             if not capture.isOpened():
@@ -181,7 +215,7 @@ class CameraWorker:
 
             # Backends may report this property as unsupported. The software
             # queue remains one slot, preserving bounded consumer latency.
-            capture.set(_buffer_size_property(), 1.0)
+            self._backend_name = str(getattr(capture, "getBackendName", lambda: "UNKNOWN")())
             if self.resolution is not None or self.target_fps is not None:
                 backend_name = getattr(capture, "getBackendName", lambda: "")()
                 if backend_name != "MSMF":
@@ -189,26 +223,49 @@ class CameraWorker:
                     capture.set(fourcc_property, float(mjpg_fourcc))
                 else:
                     LOGGER.info("MSMF backend selected; skipping unsupported MJPG negotiation")
+            if self.target_fps is not None:
+                try:
+                    capture.set(_fps_property(), self.target_fps)
+                except Exception as error:
+                    # Some backends reject FPS negotiation despite opening the
+                    # device; software capture can continue at the native rate.
+                    LOGGER.warning(
+                        "Camera %r FPS negotiation failed; continuing at native rate: %s",
+                        self.camera_id, error,
+                    )
+            get_property = getattr(capture, "get", None)
+            if callable(get_property):
+                try:
+                    reported_fps = float(get_property(_fps_property()))
+                except Exception as error:
+                    LOGGER.warning(
+                        "Camera %r FPS query failed; driver rate is unknown: %s",
+                        self.camera_id, error,
+                    )
+                    reported_fps = 0.0
+                if np.isfinite(reported_fps) and reported_fps > 0:
+                    self._actual_fps = reported_fps
+            if (self.target_fps is not None and self.target_fps > 30.0
+                    and self._actual_fps is not None and self._actual_fps < self.target_fps - 0.5):
+                capture.set(_fps_property(), 30.0)
             if self.resolution is not None:
                 width_property, height_property = _resolution_properties()
                 width, height = self.resolution
                 capture.set(width_property, float(width))
                 capture.set(height_property, float(height))
-            if self.target_fps is not None:
-                try:
-                    capture.set(_fps_property(), self.target_fps)
-                except Exception:
-                    # Some backends reject FPS negotiation despite opening the
-                    # device; software capture can continue at the native rate.
-                    pass
-            get_property = getattr(capture, "get", None)
+            capture.set(_buffer_size_property(), 1.0)
             if callable(get_property):
                 try:
+                    import cv2
                     reported_fps = float(get_property(_fps_property()))
-                except Exception:
-                    reported_fps = 0.0
-                if np.isfinite(reported_fps) and reported_fps > 0:
-                    self._actual_fps = reported_fps
+                    self._actual_fps = reported_fps if np.isfinite(reported_fps) and reported_fps > 0 else None
+                    code = int(get_property(cv2.CAP_PROP_FOURCC))
+                    fourcc = "".join(chr((code >> (8 * index)) & 0xFF) for index in range(4))
+                    LOGGER.info("[CAMERA] FourCC: %r | Resolution: %dx%d | Negotiated FPS: %.1f",
+                                fourcc, int(get_property(cv2.CAP_PROP_FRAME_WIDTH)),
+                                int(get_property(cv2.CAP_PROP_FRAME_HEIGHT)), self._actual_fps or 0.0)
+                except (ValueError, TypeError, OverflowError):
+                    LOGGER.warning("Camera driver did not report valid negotiated properties")
 
             warmed_frames = 0
             while warmed_frames < self.warmup_frames:
@@ -223,6 +280,7 @@ class CameraWorker:
                     and warmup_frame.ndim in (2, 3)
                 ):
                     warmed_frames += 1
+                    self._ready_event.set()
                     continue
 
                 self._capture_failures += 1
@@ -234,9 +292,15 @@ class CameraWorker:
                 time.sleep(0.02)
 
             self._ready_event.set()
+            if self.warmup_frames:
+                del warmup_frame
 
             while not self._stop_event.is_set():
+                read_started = time.perf_counter()
                 ok, raw_frame = capture.read()
+                self._capture_read_ms = (time.perf_counter() - read_started) * 1000.0
+                if self._stop_event.is_set():
+                    break
                 timestamp_ns = self._monotonic_ns()
                 if not ok or not isinstance(raw_frame, np.ndarray) or raw_frame.size == 0:
                     self._capture_failures += 1
@@ -255,6 +319,7 @@ class CameraWorker:
                     health_meta={
                         "capture_failures": self._capture_failures,
                         "backpressure_drops": self._backpressure_drops,
+                        "capture_read_ms": self._capture_read_ms,
                     },
                 )
                 self._frame_index += 1
@@ -264,7 +329,7 @@ class CameraWorker:
             self._ready_event.set()
         finally:
             if capture is not None:
-                capture.release()
+                self._release_capture_once(capture)
             with self._state_lock:
                 self._capture = None
             self._ready_event.set()
@@ -303,32 +368,75 @@ class CameraWorker:
         with self._latest_lock:
             return self._latest_frame
 
+    def _release_capture_once(self, capture: VideoCaptureLike) -> None:
+        """Claim the native handle before releasing, avoiding concurrent double release."""
+        with self._release_lock:
+            if self._released_capture is capture:
+                return
+            self._released_capture = capture
+        try:
+            capture.release()
+        except Exception as error:
+            self._release_error = error
+            LOGGER.exception("Camera %r handle release failed", self.camera_id)
+
     def stop(self, *, timeout: float = 2.0) -> None:
-        """Request shutdown, unblock a stuck backend if needed, and join."""
-        if timeout < 0:
-            raise ValueError("timeout must be non-negative")
-        self._stop_event.set()
+        """Stop within one total deadline, including an emergency handle release.
+
+        Normal reads exit cooperatively and release in the producer's finally.
+        A stuck native read is interrupted by one release helper. A hung driver
+        is reported rather than blocking the caller beyond its join deadline.
+        """
+        if not np.isfinite(timeout) or timeout < 0:
+            raise ValueError("timeout must be non-negative and finite")
+        deadline = time.monotonic() + timeout
+        self.request_stop()
         with self._state_lock:
             thread = self._thread
-            capture = self._capture
-        if thread is None:
-            return
+        if thread is threading.current_thread():
+            raise RuntimeError("a camera producer cannot join itself")
+        if thread is not None:
+            thread.join(min(0.5, timeout / 2.0))
 
-        thread.join(timeout)
-        if thread.is_alive() and capture is not None:
-            capture.release()
-            thread.join(timeout)
-        if thread.is_alive():
+        with self._state_lock:
+            capture = self._capture if self._capture is not None else self._released_capture
+            if capture is not None and (
+                (thread is not None and thread.is_alive()) or self._release_error is not None
+            ) and (self._release_thread is None or not self._release_thread.is_alive()):
+                if self._release_error is not None:
+                    self._released_capture = None
+                    self._release_error = None
+                self._release_thread = threading.Thread(
+                    target=self._release_capture_once, args=(capture,),
+                    name=f"camera-release-{self.camera_id}", daemon=True,
+                )
+                self._release_thread.start()
+            release_thread = self._release_thread
+
+        for pending in (thread, release_thread):
+            if pending is not None:
+                pending.join(max(0.0, deadline - time.monotonic()))
+        if any(pending is not None and pending.is_alive() for pending in (thread, release_thread)):
             raise TimeoutError(f"camera {self.camera_id!r} did not stop cleanly")
+        if self._release_error is not None:
+            raise RuntimeError(f"camera {self.camera_id!r} handle release failed") from self._release_error
         with self._state_lock:
             self._thread = None
+            self._release_thread = None
+            self._released_capture = None
         with self._latest_lock:
             self._latest_frame = None
             self._capture_timestamps_ns.clear()
+        while True:
+            try:
+                self._frames.get_nowait()
+            except queue.Empty:
+                break
 
     def request_stop(self) -> None:
         """Signal shutdown without blocking the calling thread."""
         self._stop_event.set()
+        self._ready_event.set()
 
     @property
     def is_running(self) -> bool:
@@ -351,6 +459,14 @@ class CameraWorker:
     def actual_fps(self) -> float | None:
         """Backend-reported FPS, or None when the driver does not report it."""
         return self._actual_fps
+
+    @property
+    def backend_name(self) -> str:
+        return self._backend_name
+
+    @property
+    def capture_read_ms(self) -> float:
+        return self._capture_read_ms
 
     @property
     def capture_fps(self) -> float:

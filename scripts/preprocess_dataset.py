@@ -24,6 +24,7 @@ if str(SOURCE_ROOT) not in sys.path:
     sys.path.insert(0, str(SOURCE_ROOT))
 
 from asl_stereo.contracts import FEATURE_COUNT, JOINT_COUNT
+from asl_stereo.dataset import load_signer_metadata
 from asl_stereo.landmarks import PoseHandsExtractor
 from asl_stereo.models.checkpoint import save_class_map
 from asl_stereo.preprocessing import (
@@ -271,6 +272,8 @@ def write_dataset(
     *,
     class_map: dict[int, str],
     source_video_count: int,
+    video_ids: npt.ArrayLike | None = None,
+    signer_ids: npt.ArrayLike | None = None,
 ) -> Path:
     feature_array = np.asarray(features, dtype=np.float32)
     label_array = np.asarray(labels, dtype=np.int64)
@@ -283,6 +286,17 @@ def write_dataset(
         raise ValueError("labels must have shape (N,) matching features")
     if not np.isfinite(feature_array).all():
         raise ValueError("features must contain only finite values")
+    provenance = {}
+    for name, values in (("video_ids", video_ids), ("signer_ids", signer_ids)):
+        if values is not None:
+            identifiers = np.asarray(values, dtype=str)
+            if identifiers.shape != label_array.shape:
+                raise ValueError(f"{name} must contain one identifier per window")
+            if name == "video_ids" and np.any(identifiers == ""):
+                raise ValueError("video IDs cannot be empty")
+            provenance[name] = identifiers.astype(object)
+    if signer_ids is not None and video_ids is None:
+        raise ValueError("signer_ids require video_ids")
 
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -300,6 +314,8 @@ def write_dataset(
             dtype=np.int64,
             compression="gzip",
         )
+        for name, identifiers in provenance.items():
+            h5_file.create_dataset(name, data=identifiers, dtype=h5py.string_dtype("utf-8"))
         h5_file.attrs["window_size"] = WINDOW_SIZE
         h5_file.attrs["feature_dim"] = FEATURE_COUNT
         h5_file.attrs["stride"] = STRIDE
@@ -314,14 +330,22 @@ def preprocess_dataset(
     videos_dir: str | Path,
     output_h5: str | Path,
     class_map_out: str | Path,
+    *,
+    metadata_csv: str | Path | None = None,
 ) -> tuple[npt.NDArray[np.float32], npt.NDArray[np.int64], dict[int, str]]:
     records = discover_videos(videos_dir)
     glosses = sorted({record.gloss for record in records})
     class_map = {index: gloss for index, gloss in enumerate(glosses)}
     gloss_to_id = {gloss: index for index, gloss in class_map.items()}
+    default_metadata = PROJECT_ROOT / "data" / "data.csv"
+    if metadata_csv is None and default_metadata.is_file():
+        metadata_csv = default_metadata
+    signer_map = load_signer_metadata(metadata_csv)
 
     feature_batches: list[npt.NDArray[np.float32]] = []
     label_batches: list[npt.NDArray[np.int64]] = []
+    video_batches: list[np.ndarray] = []
+    signer_batches: list[np.ndarray] = []
     skipped: list[str] = []
     pipeline = PreprocessingPipeline()
 
@@ -354,6 +378,8 @@ def preprocess_dataset(
             label_batches.append(
                 np.full(windows.shape[0], gloss_to_id[record.gloss], dtype=np.int64)
             )
+            video_batches.append(np.full(windows.shape[0], record.video_id, dtype=object))
+            signer_batches.append(np.full(windows.shape[0], signer_map.get(record.video_id, ""), dtype=object))
         except (OSError, RuntimeError, ValueError) as error:
             skipped.append(record.path.name)
             print(f"  warning: skipped ({error})", file=sys.stderr)
@@ -369,6 +395,8 @@ def preprocess_dataset(
         labels,
         class_map=class_map,
         source_video_count=len(records) - len(skipped),
+        video_ids=np.concatenate(video_batches),
+        signer_ids=np.concatenate(signer_batches),
     )
     # The serving contract is integer class ID -> gloss token.
     save_class_map(class_map, class_map_out)
@@ -415,12 +443,14 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=PROJECT_ROOT / "configs" / "class_map.json",
     )
+    parser.add_argument("--metadata-csv", type=Path, default=None)
     return parser
 
 
 def main() -> int:
     args = build_parser().parse_args()
-    preprocess_dataset(args.videos_dir, args.output_h5, args.class_map_out)
+    preprocess_dataset(args.videos_dir, args.output_h5, args.class_map_out,
+                       metadata_csv=args.metadata_csv)
     return 0
 
 

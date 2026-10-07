@@ -24,6 +24,7 @@ if str(SOURCE_ROOT) not in sys.path:
 
 from asl_stereo.models import (  # noqa: E402
     SignSequenceClassifier,
+    INTERNAL_FEATURE_COUNT,
     load_checkpoint,
     load_class_map,
     load_model_weights,
@@ -95,14 +96,39 @@ def load_fp32_classifier(
     if str(checkpoint["model_type"]) != "bilstm_attention":
         raise ValueError("unsupported checkpoint model_type")
 
-    model = SignSequenceClassifier(num_classes=int(checkpoint["num_classes"]))
+    state = checkpoint["model_state_dict"]
+    if not isinstance(state, Mapping):
+        raise ValueError("checkpoint model_state_dict must be a mapping")
+    projection = state.get("feature_projection.0.weight")
+    reduction = state.get("temporal_reduction.weight")
+    if not isinstance(projection, torch.Tensor) or projection.ndim != 2:
+        raise ValueError("checkpoint must contain a 2D feature projection weight")
+    if projection.shape[1] != INTERNAL_FEATURE_COUNT:
+        raise ValueError(
+            f"checkpoint uses {projection.shape[1]} internal features; "
+            f"the restored architecture requires {INTERNAL_FEATURE_COUNT} "
+            "(138 positions + 138 deltas + 10 hand kinematics)"
+        )
+    if not isinstance(reduction, torch.Tensor) or reduction.ndim != 2:
+        raise ValueError("checkpoint must contain a 2D temporal reduction weight")
+    model = SignSequenceClassifier(
+        num_classes=int(checkpoint["num_classes"]),
+        projection_features=int(projection.shape[0]),
+        hidden_size=int(reduction.shape[0]),
+        num_layers=int(checkpoint.get("model_config", {}).get("num_layers", 2)),
+        dropout=float(checkpoint.get("model_config", {}).get("dropout", 0.35)),
+        align_features=bool(checkpoint.get("model_config", {}).get("align_features", False)),
+    )
     load_model_weights(model, checkpoint_path, strict=True)
     model.cpu().eval()
     metadata = {
         "num_classes": int(checkpoint["num_classes"]),
         "window_size": int(checkpoint["window_size"]),
         "feature_dim": int(checkpoint["feature_dim"]),
+        "internal_feature_dim": INTERNAL_FEATURE_COUNT,
         "model_type": str(checkpoint["model_type"]),
+        "feature_alignment": checkpoint.get("feature_alignment", "none"),
+        "model_config": checkpoint.get("model_config", {}),
     }
     return model, metadata
 
@@ -138,7 +164,11 @@ def export_torchscript(
         "num_classes": len(normalized_map),
         "window_size": INPUT_SHAPE[1],
         "feature_dim": INPUT_SHAPE[2],
+        "internal_feature_dim": int(getattr(model, "internal_feature_dim", INTERNAL_FEATURE_COUNT)),
         "class_map": {str(index): label for index, label in normalized_map.items()},
+        "feature_alignment": (
+            "dominant_right_neutral_prefix_v1" if getattr(model, "feature_alignment_enabled", False) else "none"
+        ),
     }
     trace_target = _TraceableQuantizedWrapper(model.cpu().eval()).eval()
     with torch.no_grad():
@@ -237,13 +267,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--warmup", type=int, default=50)
     parser.add_argument("--iterations", type=int, default=200)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--num-threads", type=int, default=1,
+                        help="CPU thread budget (default: 1, matching live serving)")
     return parser
 
 
 def main() -> int:
     args = build_parser().parse_args()
+    if args.num_threads < 1:
+        raise ValueError("num-threads must be at least one")
     torch.manual_seed(args.seed)
-    torch.set_num_threads(max(1, torch.get_num_threads()))
+    torch.set_num_threads(args.num_threads)
     class_map = load_class_map(args.class_map)
     fp32_model, checkpoint_metadata = load_fp32_classifier(args.input_weights)
     if len(class_map) != checkpoint_metadata["num_classes"]:
@@ -278,7 +312,9 @@ def main() -> int:
     )
     report = {
         "input_contract": {"shape": list(INPUT_SHAPE), "dtype": "float32", "device": "cpu"},
-        "benchmark": {"warmup": args.warmup, "iterations": args.iterations},
+        "benchmark": {"warmup": args.warmup, "iterations": args.iterations,
+                      "cpu_num_threads": args.num_threads},
+        "checkpoint_contract": checkpoint_metadata,
         "baseline_fp32": asdict(baseline),
         "optimized_int8_torchscript": asdict(optimized),
         "latency_gate_ms": 80.0,

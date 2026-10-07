@@ -125,6 +125,34 @@ def test_extractor_downscales_only_inference_image() -> None:
     assert received == [((360, 640, 3), False), ((360, 640, 3), False)]
     assert output.coordinates.shape == (46, 3)
     assert full_frame.shape == (720, 1280, 3)
+    assert extractor.last_timings is not None
+    assert extractor.last_timings.resize_ms >= 0.0
+    assert extractor.last_timings.pose_ms >= 0.0
+    assert extractor.last_timings.hands_ms >= 0.0
+    assert extractor.last_timings.total_ms >= extractor.last_timings.resize_ms
+
+
+def test_default_pose_stays_lite_without_local_asset_probe(monkeypatch) -> None:
+    import asl_stereo.landmarks.holistic_extractor as extractor_module
+
+    pose_options = {}
+    pose_module = SimpleNamespace(
+        Pose=lambda **options: (pose_options.update(options) or _FakeTracker(
+            SimpleNamespace(pose_landmarks=None), options
+        ))
+    )
+    hands_module = SimpleNamespace(
+        Hands=lambda **options: _FakeTracker(
+            SimpleNamespace(multi_hand_landmarks=None), options
+        )
+    )
+    monkeypatch.setattr(
+        extractor_module, "_load_solution_modules", lambda: (pose_module, hands_module)
+    )
+
+    with PoseHandsExtractor() as extractor:
+        assert extractor.model_complexity == 0
+        assert pose_options["model_complexity"] == 0
 
 
 def test_handedness_stays_stable_during_crossing() -> None:

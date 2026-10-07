@@ -81,8 +81,12 @@ def load_model_weights(
         state_dict = checkpoint["model_state_dict"]
     elif "state_dict" in checkpoint:
         state_dict = checkpoint["state_dict"]
+        if hasattr(model, "feature_alignment_enabled"):
+            model.feature_alignment_enabled = False
     else:
         state_dict = checkpoint
+        if hasattr(model, "feature_alignment_enabled"):
+            model.feature_alignment_enabled = False
     if not isinstance(state_dict, Mapping):
         raise ValueError("checkpoint must contain a state dictionary")
     model.load_state_dict(state_dict, strict=strict)
@@ -117,6 +121,17 @@ def save_training_checkpoint(
         "epoch": epoch,
         "best_val_acc": float(best_val_acc),
     }
+    if getattr(model, "model_type", None) == "bilstm_attention":
+        payload["model_config"] = {
+            "projection_features": model.projection_features,
+            "hidden_size": model.hidden_size,
+            "num_layers": model.num_layers,
+            "dropout": model.dropout_probability,
+            "align_features": model.feature_alignment_enabled,
+        }
+        payload["feature_alignment"] = (
+            "dominant_right_neutral_prefix_v1" if model.feature_alignment_enabled else "none"
+        )
 
     temporary_path: Path | None = None
     try:
@@ -173,6 +188,16 @@ def _validate_checkpoint_schema(model: nn.Module, checkpoint: Mapping[str, Any])
         raise ValueError("checkpoint window_size must be 45")
     if str(checkpoint["model_type"]) != "bilstm_attention":
         raise ValueError("unsupported checkpoint model_type")
+    # Legacy checkpoints predate the in-memory transform. Do not silently
+    # reinterpret their trained coordinate semantics when loading them.
+    enabled = bool(checkpoint.get("model_config", {}).get("align_features", False))
+    version = checkpoint.get("feature_alignment", "none")
+    if version not in ("none", "dominant_right_neutral_prefix_v1"):
+        raise ValueError("unsupported checkpoint feature alignment version")
+    if enabled and version == "none":
+        raise ValueError("aligned checkpoint requires feature alignment version metadata")
+    if hasattr(model, "feature_alignment_enabled"):
+        model.feature_alignment_enabled = enabled
 
 
 def load_class_map(

@@ -62,12 +62,14 @@ class BatchFeatureExtractor:
             raise RuntimeError(f"OpenCV could not open video: {path}")
 
         raw_frames: list[npt.NDArray[np.float32]] = []
-        extractor = self._get_extractor()
-        reset_tracking = getattr(extractor, "reset_tracking", None)
-        if callable(reset_tracking):
-            reset_tracking()
         frame_index = 0
         try:
+            # Extractor construction/reset can fail before the first read. Keep
+            # those operations inside the capture's cleanup boundary as well.
+            extractor = self._get_extractor()
+            reset_tracking = getattr(extractor, "reset_tracking", None)
+            if callable(reset_tracking):
+                reset_tracking()
             while True:
                 ok, frame = capture.read()
                 if not ok:

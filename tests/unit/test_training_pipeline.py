@@ -112,9 +112,13 @@ def test_structured_checkpoint_loads_through_inference_engine(tmp_path) -> None:
         "model_type",
         "epoch",
         "best_val_acc",
+        "model_config",
+        "feature_alignment",
     }
     assert checkpoint["epoch"] == 1
     assert checkpoint["best_val_acc"] == 0.875
+    assert checkpoint["model_config"]["dropout"] == 0.35
+    assert checkpoint["model_config"]["align_features"] is True
     assert json.loads(class_map_path.read_text(encoding="utf-8")) == {
         "0": "HELLO",
         "1": "HELP",

@@ -15,7 +15,7 @@ from asl_stereo.contracts.validation import FEATURE_COUNT
 class TemporalBuffer:
     """Maintain the latest valid frames and emit owned contiguous windows."""
 
-    def __init__(self, window_size: int = 45, stride: int = 8) -> None:
+    def __init__(self, window_size: int = 45, stride: int = 8, *, align_features: bool = False) -> None:
         if isinstance(window_size, bool) or not isinstance(window_size, int):
             raise TypeError("window_size must be an integer")
         if not 30 <= window_size <= 60:
@@ -25,6 +25,7 @@ class TemporalBuffer:
 
         self.window_size = window_size
         self.stride = stride
+        self.align_features = align_features
         self._frames: deque[npt.NDArray[np.float32]] = deque(maxlen=window_size)
         self._timestamps: deque[int] = deque(maxlen=window_size)
         self._valid_since_emission = 0
@@ -58,7 +59,9 @@ class TemporalBuffer:
         if self._timestamps and timestamp <= self._timestamps[-1]:
             raise ValueError("valid-frame timestamps must be strictly increasing")
 
-        self._frames.append(np.ascontiguousarray(array, dtype=np.float32))
+        # A producer may reuse even a FeatureVector's backing allocation.
+        # Own the historical frame before returning control to that producer.
+        self._frames.append(np.array(array, dtype=np.float32, order="C", copy=True))
         self._timestamps.append(timestamp)
         self._valid_since_emission += 1
 
@@ -70,6 +73,10 @@ class TemporalBuffer:
         # The emitted array owns its memory, so producer writes cannot race inference.
         matrix = np.stack(tuple(self._frames), axis=0).astype(np.float32, copy=False)
         batch = np.ascontiguousarray(matrix[np.newaxis, :, :])
+        if self.align_features:
+            import torch
+            from asl_stereo.models.feature_alignment import align_feature_window
+            batch = align_feature_window(torch.from_numpy(batch)).numpy()
         window = TemporalWindow(
             values=batch,
             start_timestamp_ns=self._timestamps[0],
@@ -96,8 +103,8 @@ class SlidingWindowBuffer(TemporalBuffer):
     ``torch.from_numpy`` then creates a tensor sharing that snapshot's storage.
     """
 
-    def __init__(self, window_size: int = 45, stride: int = 8) -> None:
-        super().__init__(window_size=window_size, stride=stride)
+    def __init__(self, window_size: int = 45, stride: int = 8, *, align_features: bool = False) -> None:
+        super().__init__(window_size=window_size, stride=stride, align_features=align_features)
         self.last_window_start_timestamp_ns: int | None = None
         self.last_window_end_timestamp_ns: int | None = None
         self._raw_landmarks: deque[npt.NDArray[np.float32]] = deque(
@@ -193,6 +200,9 @@ class SlidingWindowBuffer(TemporalBuffer):
         self._has_emitted = True
         self._valid_since_emission = 0
         tensor = torch.from_numpy(batch)
+        if self.align_features:
+            from asl_stereo.models.feature_alignment import align_feature_window
+            tensor = align_feature_window(tensor)
         assert tensor.shape == (1, self.window_size, FEATURE_COUNT)
         assert tensor.dtype == torch.float32
         return tensor

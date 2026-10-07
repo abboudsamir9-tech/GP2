@@ -7,10 +7,10 @@ module never instantiates a Holistic, face, or segmentation graph.
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from pathlib import Path
 from types import TracebackType
 from typing import Any, TypeVar
 
@@ -48,6 +48,20 @@ class OverlayPoint:
 
 
 @dataclass(frozen=True, slots=True)
+class ExtractionTimings:
+    resize_ms: float
+    pose_ms: float
+    hands_ms: float
+    total_ms: float
+
+
+def _timed_tracker_process(tracker: Any, rgb: np.ndarray) -> tuple[Any, float]:
+    started = time.perf_counter()
+    results = tracker.process(rgb)
+    return results, (time.perf_counter() - started) * 1000.0
+
+
+@dataclass(frozen=True, slots=True)
 class RestrictedPoseHandsResults:
     """Only the 46 permitted landmarks retained for overlay rendering."""
 
@@ -81,13 +95,8 @@ class PoseHandsExtractor:
         self.processing_resolution = processing_resolution
         self.input_is_mirrored = bool(input_is_mirrored)
         if pose_factory is None or hands_factory is None:
-            import mediapipe as mp
             mp_pose, mp_hands = _load_solution_modules()
             if pose_factory is None:
-                lite_model = Path(mp.__file__).resolve().parent / "modules" / "pose_landmark" / "pose_landmark_lite.tflite"
-                if model_complexity == 0 and not lite_model.is_file():
-                    LOGGER.warning("MediaPipe Lite pose model missing at %s; using bundled full pose model", lite_model)
-                    model_complexity = 1
                 pose_factory = mp_pose.Pose
             if hands_factory is None:
                 hands_factory = mp_hands.Hands
@@ -117,10 +126,15 @@ class PoseHandsExtractor:
         self._last_results: RestrictedPoseHandsResults | None = None
         self._hand_seen = np.zeros(2, dtype=bool)
         self._closed = False
+        self._last_timings: ExtractionTimings | None = None
 
     @property
     def last_results(self) -> RestrictedPoseHandsResults | None:
         return self._last_results
+
+    @property
+    def last_timings(self) -> ExtractionTimings | None:
+        return self._last_timings
 
     def process(
         self,
@@ -129,6 +143,7 @@ class PoseHandsExtractor:
         timestamp_ns: int = 0,
         frame_index: int = 0,
     ) -> LandmarkFrame:
+        process_started = time.perf_counter()
         if self._closed:
             raise RuntimeError("extractor is closed")
         if not isinstance(frame, np.ndarray) or frame.dtype != np.uint8:
@@ -144,7 +159,7 @@ class PoseHandsExtractor:
             frame = cv2.resize(
                 frame,
                 (max(1, round(width * scale)), max(1, round(height * scale))),
-                interpolation=cv2.INTER_AREA,
+                interpolation=cv2.INTER_NEAREST,
             )
         if frame.ndim == 2:
             rgb = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
@@ -153,11 +168,12 @@ class PoseHandsExtractor:
         else:
             raise ValueError("frame must be grayscale or BGR with three channels")
         rgb.flags.writeable = False
+        resize_ms = (time.perf_counter() - process_started) * 1000.0
 
-        pose_future = self._tracker_pool.submit(self.pose_tracker.process, rgb)
-        hands_future = self._tracker_pool.submit(self.hand_tracker.process, rgb)
-        pose_results = pose_future.result()
-        hands_results = hands_future.result()
+        pose_future = self._tracker_pool.submit(_timed_tracker_process, self.pose_tracker, rgb)
+        hands_future = self._tracker_pool.submit(_timed_tracker_process, self.hand_tracker, rgb)
+        pose_results, pose_ms = pose_future.result()
+        hands_results, hands_ms = hands_future.result()
         coordinates = np.full((JOINT_COUNT, 3), np.nan, dtype=np.float32)
         hand_present = np.zeros(2, dtype=np.float32)
         upper_body = self._extract_upper_body(getattr(pose_results, "pose_landmarks", None), coordinates)
@@ -186,6 +202,9 @@ class PoseHandsExtractor:
         self._last_results = RestrictedPoseHandsResults(left, right, upper_body)
         assert coordinates.shape == (JOINT_COUNT, 3)
         joint_mask = np.isfinite(coordinates).all(axis=1).astype(np.float32)
+        self._last_timings = ExtractionTimings(
+            resize_ms, pose_ms, hands_ms, (time.perf_counter() - process_started) * 1000.0,
+        )
         return LandmarkFrame(
             coordinates=coordinates,
             hand_presence=hand_present,
@@ -200,6 +219,7 @@ class PoseHandsExtractor:
             raise RuntimeError("extractor is closed")
         self._hand_seen[:] = False
         self._last_results = None
+        self._last_timings = None
 
     def _assign_hands(
         self, results: Any, output: npt.NDArray[np.float32]
@@ -314,5 +334,6 @@ HolisticExtractor = PoseHandsExtractor
 
 __all__ = [
     "PoseHandsExtractor", "HolisticExtractor", "OverlayPoint",
+    "ExtractionTimings",
     "RestrictedPoseHandsResults", "RestrictedHolisticResults",
 ]
